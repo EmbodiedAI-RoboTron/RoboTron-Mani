@@ -1,10 +1,10 @@
-# RoboMM: All-in-One Multimodal Large Model for Robotic Manipulation
+# RoboTron-Mani: All-in-One Multimodal Large Model for Robotic Manipulation
 ### 🚩[Project Page](https://robouniview.github.io/RoboMM.github.io/) | 📑[Paper](https://arxiv.org/pdf/2412.07215v1) | 🤗[Data](https://huggingface.co/datasets/liufanfanlff/RoboData)
 
 
-This is the unorganized version of the code for RoboMM: All-in-One Multimodal Large Model for Robotic Manipulation.
+This is the unorganized version of the code for RoboTron-Mani: All-in-One Multimodal Large Model for Robotic Manipulation.
 
-> RoboMM: All-in-One Multimodal Large Model for Robotic Manipulation <br>
+> RoboTron-Mani: All-in-One Multimodal Large Model for Robotic Manipulation <br>
 > [Fen Yan](https://scholar.google.com.hk/citations?user=gO4divAAAAAJ&hl=zh-CN&oi=sra)\*, [Fanfan Liu](https://scholar.google.com/citations?user=LPaXZEUAAAAJ&hl=en)\*, [Liming Zheng](), [Yufeng Zhong](), [Yiyang Huang](), [Zechao Guan](), [Chenjian Feng](https://fcjian.github.io/), [Lin Ma](http://forestlinma.com/)† <br>
 > Email: [bphengyan@163.com](bphengyan@163.com)
 > *Equal Contribution   †Corresponding Authors

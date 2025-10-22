@@ -115,13 +115,12 @@ License: [MIT](https://github.com/RoboFlamingo/RoboFlamingo/blob/main/LICENSE)
 
 ## Cite our work:
 ```
-@misc{yan2024robomm,
-      title={RoboMM: All-in-One Multimodal Large Model for Robotic Manipulation}, 
-      author={Feng Yan and Fanfan Liu and Liming Zheng and Yufeng Zhong and Yiyang Huang and Zechao Guan and Chengjian Feng and Lin Ma},
-      year={2024},
-      eprint={2412.07215},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2412.07215}, 
+@InProceedings{Yan_2025_ICCV,
+    author    = {Yan, Feng and Liu, Fanfan and Huang, Yiyang and Guan, Zechao and Zheng, Liming and Zhong, Yufeng and Feng, Chengjian and Ma, Lin},
+    title     = {RoboTron-Mani: All-in-One Multimodal Large Model for Robotic Manipulation},
+    booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
+    month     = {October},
+    year      = {2025},
+    pages     = {13707-13718}
 }
 ```

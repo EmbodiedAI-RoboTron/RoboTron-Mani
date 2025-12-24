@@ -22,6 +22,7 @@ Its design significantly enhances robotic manipulation performance, increasing t
 </div>
 
 ## :fire: Updates
+- **2025.10**: Excited to share that our paper has been accepted to ICCV 2025!
 - **2024.12**: We release RoboMM paper on arxiv！We release the training and inference code!
 
 ## Installation

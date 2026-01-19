@@ -1,5 +1,5 @@
 # RoboTron-Mani: All-in-One Multimodal Large Model for Robotic Manipulation
-### 🚩[Project Page](https://robouniview.github.io/RoboMM.github.io/) | 📑[Paper](https://arxiv.org/pdf/2412.07215v1) | 🤗[Data](https://huggingface.co/datasets/liufanfanlff/RoboData)
+### 🚩[Project Page](https://robouniview.github.io/RoboMM.github.io/) | 📑[Paper](https://openaccess.thecvf.com/content/ICCV2025/papers/Yan_RoboTron-Mani_All-in-One_Multimodal_Large_Model_for_Robotic_Manipulation_ICCV_2025_paper.pdf) | 🤗[Data](https://huggingface.co/datasets/liufanfanlff/RoboData)
 
 
 This is the unorganized version of the code for RoboTron-Mani: All-in-One Multimodal Large Model for Robotic Manipulation.

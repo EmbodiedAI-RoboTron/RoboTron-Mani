@@ -103,7 +103,7 @@ class MSDeformAttn(nn.Module):
             raise ValueError(
                 'Last dim of reference_points must be 2 or 4, but get {} instead.'.format(reference_points.shape[-1]))
 
-        if self.global_config.precision == 'fp16':
+        if self.global_config.training.precision == 'fp16':
             sampling_locations = sampling_locations.half()
             attention_weights = attention_weights.half()
        

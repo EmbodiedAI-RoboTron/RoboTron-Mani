@@ -6,8 +6,8 @@ import numpy as np
 import math
 import torch.nn.functional as F
 from robouniview.models.transformers.ops.uvformer.modules import MSDeformAttn
-if 'V100' in torch.cuda.get_device_properties(0).name:
-    from robouniview.models.transformers.ops.uvformer_v100.modules import MSDeformAttn
+# if 'V100' in torch.cuda.get_device_properties(0).name:
+#     from robouniview.models.transformers.ops.uvformer_v100.modules import MSDeformAttn
 from robouniview.models.transformers.transformer_utils import _get_activation_fn
 from robouniview.models.transformers.transformer_utils import _get_clones
 from robouniview.models.transformers.transformer_utils import encode_grid_to_emb2d
@@ -126,40 +126,41 @@ class DeformableTransformer(nn.Module):
         self.use_frustum_refpoints = getattr(global_config, 'use_frustum_refpoints', False)
         self.dynamic_query_embed = dynamic_query_embed
 
-        d_model = transformer_config['hidden_dim']
+        d_model = transformer_config.hidden_dim
         self.d_model = d_model
-        nhead = transformer_config['nhead']
-        num_decoder_layers = transformer_config['num_decoder_layers']
-        dim_feedforward = transformer_config['dim_feedforward']
-        dropout = transformer_config['dropout']
+        nhead = transformer_config.nhead
+        num_decoder_layers = transformer_config.num_decoder_layers
+        dim_feedforward = transformer_config.dim_feedforward
+        dropout = transformer_config.dropout
         activation = 'relu'
         dec_n_points = 4
-        task_name = transformer_config['task_name']
-        self_attn_type = transformer_config['self_attn_type']
+        task_name = transformer_config.task_name
+        self_attn_type = transformer_config.self_attn_type
 
         # init cameras
         # this is hacked for back-compatibility
         if self.global_config.UVformer != {}:
-            self.cams = self.global_config.cam_trained.copy()
+            self.cams = self.global_config.cameras.cam_trained.copy()
         else:
-            self.cams = self.global_config.Tasks[task_name]['cam_used'] + self.global_config.virtual_cams
+            virtual_cams = getattr(self.global_config.cameras, 'virtual_cams', [])
+            self.cams = self.global_config.Tasks.get(task_name, {}).get('cam_used', []) + virtual_cams
         if 'cam_trained' in self.transformer_config:
             self.cams = self.transformer_config['cam_trained']
         self.num_cams = len(self.cams)
-        self.num_input_feat = len(self.global_config.image_feature_out)
+        self.num_input_feat = len(self.global_config.cameras.image_feature_out)
         #self.orig_to_actual_img_ratio = self.global_config.orig_to_actual_img_ratio
 
         #preprocess_config = self.global_config.Tasks[task_name]['PreProcessing']
 
-        preprocess_config = transformer_config['PreProcessing']
+        preprocess_config = transformer_config.PreProcessing
 
 
         self.front, self.rear, self.left, self.right = [preprocess_config[x] for x in
                                                         ['front', 'back', 'left', 'right']]
-        ref_z_range = transformer_config['ref_z_range']
+        ref_z_range = transformer_config.ref_z_range
 
         if 'rotate' in transformer_config:
-            if transformer_config['rotate']:
+            if transformer_config.rotate:
                 self.uv_range = [-self.front, self.rear, -self.left, self.right, ref_z_range[0], ref_z_range[1]]
             else:
                 self.uv_range = [self.front, -self.rear, self.left, -self.right, ref_z_range[1], ref_z_range[0]]
@@ -167,7 +168,7 @@ class DeformableTransformer(nn.Module):
             self.uv_range = [self.front, -self.rear, self.left, -self.right, ref_z_range[1], ref_z_range[0]]
 
         self.norm = transformer_config.get('norm', 'gn')
-        self.grid_resolution = transformer_config['grid_resolution']
+        self.grid_resolution = transformer_config.grid_resolution
         self.uv_grid = create_uv_grid(self.uv_range, self.grid_resolution, self.use_frustum_refpoints)
         self.uv_x, self.uv_y, self.uv_z = self.uv_grid.shape[:3]
         self.num_queries = self.uv_x * self.uv_y
@@ -203,7 +204,7 @@ class DeformableTransformer(nn.Module):
                 self.orig_query_embed = nn.Embedding(self.num_queries, d_model)
 
         # upsample uv feat
-        upsample_ratio = transformer_config.get('upsample', 1)
+        upsample_ratio = transformer_config.upsample
         assert math.log(upsample_ratio, 2).is_integer()
         upsample_layers = []
         while upsample_ratio > 1:
@@ -395,9 +396,9 @@ class DeformableTransformer(nn.Module):
         unpacked_calibs = unpack_calib(calib, bs)
         reference_points, reference_points_valid, valid_weight = [], [], []
         for i, curr_calib in enumerate(unpacked_calibs): # for bs
-            extrinsic_jitter = self.global_config.extrinsic_jitter
+            extrinsic_jitter = self.global_config.data.extrinsic_jitter
             if extrinsic_jitter > 0:
-                if self.transformer_config['reuse_ref_point']:
+                if self.transformer_config.reuse_ref_point:
                     # if reuse, we use the same ypr and bigger step
                     step = 0.1
                     all_choice = np.arange(start=-extrinsic_jitter, stop=extrinsic_jitter + step, step=step)
@@ -412,7 +413,7 @@ class DeformableTransformer(nn.Module):
                     ypr_jitter = [yaw_jitter, pitch_jitter, roll_jitter]
             else:
                 if hasattr(self.global_config, 'eval_jitter'):
-                    eval_jitter = self.global_config.eval_jitter
+                    eval_jitter = self.global_config.data.eval_jitter
                     ypr_jitter = [eval_jitter] * 3
                 else:
                     ypr_jitter = [0.0, 0.0, 0.0]

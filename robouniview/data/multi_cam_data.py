@@ -1,97 +1,132 @@
-import ast
-from cgitb import text
+"""
+Multi-camera dataset loading and processing module.
+
+This module provides dataset classes for loading and processing multi-camera
+robotics data from various sources (Calvin, MetaWorld, Libero, RoboCasa, etc.).
+"""
+
+# Standard library imports
+import copy
 import functools
-import io, time
+import glob
+import io
 import json
 import logging
 import math
 import os
+import pickle
 import random
+import re
 import sys
-import glob
 import tarfile
-from dataclasses import dataclass
-from multiprocessing import Value
+import time
 import zipfile
-import cv2, copy
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from itertools import chain
+from multiprocessing import Value
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+# Third-party imports
 import braceexpand
-import torch
-import torchvision
-import webdataset as wds
+import cv2
+import h5py
+import hydra
 import numpy as np
-from scipy.spatial.transform import Rotation
+import open3d as o3d
+import pybullet
+import pyhash
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+import webdataset as wds
+from omegaconf import DictConfig, OmegaConf
 from PIL import Image
-from torch.utils.data import DataLoader, IterableDataset, get_worker_info, Dataset
-from torch.utils.data.distributed import DistributedSampler
-# import pybullet as pb
-# sys.path.append('/project/robotic/calvin/calvin_models')
-# sys.path.append('/project/robotic/calvin/calvin_env')
-# sys.path.append('/project/robotic/calvin/calvin_env/tacto_env')
+from scipy.spatial.transform import Rotation, Rotation as scipyR
+from torch.utils.data import (
+    DataLoader,
+    Dataset,
+    DistributedSampler,
+)
+import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+
+# Local application imports
 from calvin_agent.datasets.utils.episode_utils import (
     get_state_info_dict,
+    lookup_naming_pattern,
     process_actions,
     process_depth,
     process_state,
 )
-# 仿真器
-from scipy.spatial.transform import Rotation as scipyR 
-import hydra , pybullet
-import open3d as o3d
-from omegaconf import OmegaConf
-from calvin_env.envs.play_table_env import get_env
 from calvin_agent.evaluation.utils import (
     count_success,
     get_env_state_for_initial_condition,
     print_and_save,
 )
-# os.environ['PYOPENGL_PLATFORM'] = 'egl'
+from calvin_env.envs.play_table_env import get_env
+from robouniview.data.data_utils import (
+    ColorJitter_ctm,
+    OccupancyVFE,
+    RandomShiftsAug,
+    cam,
+    deproject,
+    get_gripper_camera_view_matrix,
+)
+from robouniview.data.vl_dataset import CaptionDataset, VQADataset
+import robouniview.data.transform_utils as robosuite_trans
 
-from omegaconf import DictConfig
-import pyhash
-import torch
-from torch.utils.data import Dataset
-from robouniview.data.real_dataset_hdf5 import RealDatasetHDF5
-import re,h5py
-import torchvision.transforms as transforms
-from robouniview.data.data_utils import OccupancyVFE
-from .zipreader import ZipReader
-from concurrent.futures import ThreadPoolExecutor
-
-Image.MAX_IMAGE_PIXELS = 1000000000
-MAX_NUM_TOKENS = 256
-MAX_NUM_IMAGES = 5
-TINY_IMAGE_SIZE_THRESHOLD = 1
-N_CHANNELS = 3
-INTERLEAVED_IMAGE_SIZE = 224
-
-_SHARD_SHUFFLE_SIZE = 2000
-_SHARD_SHUFFLE_INITIAL = 500
-_SAMPLE_SHUFFLE_SIZE = 5000
-_SAMPLE_SHUFFLE_INITIAL = 1000
-
-MIN_KB = 10
-MAX_NUM_IMAGES = 5
-
+# Optional imports
 try:
     import horovod.torch as hvd
 except ImportError:
     hvd = None
 
-from pathlib import Path
-from typing import Dict, Tuple, Union
-from robouniview.data.vl_dataset import CaptionDataset, VQADataset
+# Module-level constants
+Image.MAX_IMAGE_PIXELS = 1000000000
+
+# Module-level variables
 hasher = pyhash.fnv1_32()
 logger = logging.getLogger(__name__)
-import random
-import torchvision.transforms.functional as visionF
-from typing import Any, Dict, List, Tuple, Callable
-from itertools import chain
-from calvin_agent.datasets.utils.episode_utils import lookup_naming_pattern
-import pickle
-import torch.nn as nn
-import torch.nn.functional as F
-from robouniview.data.data_utils  import ColorJitter_ctm, OccupancyVFE, deproject, cam, get_gripper_camera_view_matrix, RandomShiftsAug
-import robosuite.utils.transform_utils as robosuite_trans
+
+
+
+
+class LeRobotDataset(lerobot_dataset.LeRobotDataset):
+    def __init__(self, repo_id: str, *args, **kwargs):
+        super().__init__(repo_id, *args, **kwargs)
+
+    def __getitem__(self, idx) -> dict:
+        item = self.hf_dataset[idx]
+        ep_idx = item["episode_index"].item()
+
+        query_indices = None
+        if self.delta_indices is not None:
+            query_indices, padding = self._get_query_indices(idx, ep_idx)
+            query_result = self._query_hf_dataset(query_indices)
+            item = {**item, **padding}
+            for key, val in query_result.items():
+                item[key] = val
+
+        if len(self.meta.video_keys) > 0:
+            current_ts = item["timestamp"].item()
+            query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+            video_frames = self._query_videos(query_timestamps, ep_idx)
+            item = {**video_frames, **item}
+
+        if self.image_transforms is not None:
+            image_keys = self.meta.camera_keys
+            for cam in image_keys:
+                item[cam] = self.image_transforms(item[cam])
+
+        # Add task as a string
+        task_idx = item["task_index"].item()
+        item["task"] = self.meta.tasks[task_idx]
+
+        return item
+
 
 def load_from_zip(zip_ref, filename):
     with zip_ref.open(filename) as file:
@@ -140,6 +175,60 @@ prop_state = DictConfig(
 keys_calib = ['static_extrinsic_matrix','static_intrinsic_matrix','static_distCoeffs_matrix',
                 'gripper_extrinsic_matrix','gripper_intrinsic_matrix','gripper_distCoeffs_matrix','state_matrix','static_fov', 'gripper_fov', 'gripper_cam2gripper'] 
 
+# Common keys/constants
+RGB_KEYS = ['rgb_static', 'rgb_gripper']
+# Flip signs on Y/Z axes in homogeneous 4x4 matrices to match deproject conventions
+SIGN_FLIP_4X4 = np.array([[1, 1, 1, 1],
+                          [-1, -1, -1, -1],
+                          [-1, -1, -1, -1],
+                          [1, 1, 1, 1]])
+# Axis swap rotation used to align axis conventions, with homogeneous coordinate preserved
+AXIS_SWAP_R = np.array([
+    [0, 1, 0, 0],
+    [-1, 0, 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1],
+])
+
+# ---- Helpers (keep minimal to avoid broad behavior changes) ----
+def invert_and_flip(matrix: np.ndarray) -> np.ndarray:
+    return np.linalg.inv(matrix) * SIGN_FLIP_4X4
+
+def apply_translate(matrix: np.ndarray, translate_4x4: np.ndarray) -> np.ndarray:
+    return np.dot(matrix, translate_4x4)
+
+def apply_rotate(matrix: np.ndarray, rotate_4x4: np.ndarray) -> np.ndarray:
+    return np.dot(matrix, rotate_4x4)
+
+def compute_fov_from_intrinsics(intrinsic_matrix: np.ndarray, image_width: int) -> float:
+    fx = intrinsic_matrix[0, 0]
+    return 2 * np.arctan(image_width / (2 * fx)) * 180 / np.pi
+
+def depth_to_meters(depth: np.ndarray, near: float, far: float, mode: str = "linear") -> np.ndarray:
+    """
+    Convert depth to metric distance.
+    mode:
+      - 'linear': near + depth * (far - near)
+      - 'gl': near / (1 - depth * (1 - near / far))  # typical OpenGL clip mapping
+    """
+    if mode == "linear":
+        return near + depth * (far - near)
+    elif mode == "gl":
+        return near / (1 - depth * (1 - near / far))
+    else:
+        return depth
+
+def apply_color_jitter_pair(jitter_fn, img_static, img_gripper, jitter_state=None):
+    """
+    Apply identical color jitter augmentation to a pair of images, tracking state.
+    jitter_fn should return (img, fn_idx, brightness_factor, contrast_factor, saturation_factor, hue_factor)
+    """
+    if jitter_state is None:
+        img_static, *jitter_state = jitter_fn(img_static)
+    else:
+        img_static, *jitter_state = jitter_fn(img_static, *jitter_state)
+    img_gripper, *jitter_state = jitter_fn(img_gripper, *jitter_state)
+    return img_static, img_gripper, tuple(jitter_state)
 
 class BaseCalvinDataset(Dataset):
     """
@@ -200,12 +289,11 @@ class BaseCalvinDataset(Dataset):
             self.min_window_size = min_window_size
             self.max_window_size = max_window_size
         self.act_step = act_step
-        # print('ws {}, min_ws {}, max_ws {}'.format(self.window_size, self.max_window_size, self.min_window_size))
         self.abs_datasets_dir = datasets_dir
         self.lang_folder = lang_folder  # if self.with_lang else None
         self.aux_lang_loss_window = aux_lang_loss_window
         self.traj_cons = traj_cons
-        with open('/project/robotic/RoboFlamingo/enrich_lang_annotations.json', 'r') as f:
+        with open('/mnt/data/yanfeng/project/RoboTron-Mani/enrich_lang_annotations.json', 'r') as f:
             self.enrich_lang = json.load(f)
         self.text_aug = text_aug
 
@@ -216,10 +304,6 @@ class BaseCalvinDataset(Dataset):
         if self.gripper_pad != -1:
             self.gripper_shift = RandomShiftsAug(gripper_pad)
 
-        # assert (
-        #     "validation" in self.abs_datasets_dir.as_posix()
-        #     or "training" in self.abs_datasets_dir.as_posix()
-        # )
         self.validation = "validation" in self.abs_datasets_dir.as_posix()
         assert self.abs_datasets_dir.is_dir()
         logger.info(f"loading dataset at {self.abs_datasets_dir}")
@@ -229,7 +313,7 @@ class BaseCalvinDataset(Dataset):
         self,
         episode: Dict[str, np.ndarray],
         observation_space: DictConfig,
-        transforms: Dict,
+        transforms: Dict[str, Callable],
         seq_idx: int = 0,
         window_size: int = 0,
     ) -> Dict[str, Dict[str, torch.Tensor]]:
@@ -238,26 +322,14 @@ class BaseCalvinDataset(Dataset):
        
         for _, rgb_obs_key in enumerate(rgb_obs_keys):
             rgb_obs = episode[rgb_obs_key]
-            # expand dims for single environment obs
-            # if len(rgb_obs.shape) != 4:
-            #     rgb_obs = np.expand_dims(rgb_obs, axis=0)
-            # assert len(rgb_obs.shape) == 4
             if window_size == 0 and seq_idx == 0:  # single file loader
-                # To Square image
-                # seq_rgb_obs_ = torch.from_numpy(rgb_obs).byte()
                 seq_rgb_obs_ = rgb_obs
             else:  # episode loader 
-                # seq_rgb_obs_ = torch.from_numpy(
-                #     rgb_obs[seq_idx : seq_idx + window_size]
-                # ).byte()
                 seq_rgb_obs_ = rgb_obs[seq_idx : seq_idx + window_size]
             
             if rgb_obs_key in transforms:
-                # seq_rgb_obs_ = transforms[rgb_obs_key](seq_rgb_obs_)
-                # seq_rgb_obs_ = torch.stack([transforms[rgb_obs_key](Image.fromarray(img)) for img in seq_rgb_obs_])
                 seq_rgb_obs_ = torch.stack([transforms[rgb_obs_key](img) for img in seq_rgb_obs_])
             seq_rgb_obs_dict[rgb_obs_key] = seq_rgb_obs_
-        # shape: N_rgb_obs x (BxHxWxC)
         return {"rgb_obs": seq_rgb_obs_dict}
     
     def process_calib(
@@ -266,8 +338,6 @@ class BaseCalvinDataset(Dataset):
         seq_idx: int = 0,
         window_size: int = 0,
     ) -> Dict[str, Dict[str, torch.Tensor]]:
-        # keys_calib = ['static_extrinsic_matrix','static_intrinsic_matrix','static_distCoeffs_matrix',
-        #                 'gripper_extrinsic_matrix','gripper_intrinsic_matrix','gripper_distCoeffs_matrix','state_matrix'] 
         seq_calib_obs_dict = {}
         for _, calib_obs_key in enumerate(keys_calib):
             calib_obs = episode[calib_obs_key]
@@ -344,23 +414,10 @@ class BaseCalvinDataset(Dataset):
                     if self.pad:
                         pad_size = self._get_pad_size(sequence)
                         sequence = self._pad_sequence(sequence, pad_size, head=head)
-                    
-                    # import copy
-                    # new_list = []
-                    # np_rgb = copy.deepcopy(sequence["rgb_obs"]["rgb_static"].numpy())
-                    # for i in range(np_rgb.shape[0]):
-                    #     new_list.append(Image.fromarray(np_rgb[i, :, :, :].astype(np.uint8)))
-                    # sequence["rgb_obs"]["rgb_static"] = new_list
-                    # new_list = []
-                    # np_gripper = copy.deepcopy(sequence["rgb_obs"]["rgb_gripper"].numpy())
-                    # for i in range(np_gripper.shape[0]):
-                    #     new_list.append(Image.fromarray(np_gripper[i, :, :, :].astype(np.uint8))) #uint8
-                    # sequence["rgb_obs"]["rgb_gripper"] = new_list
                     return sequence
             
             except Exception as e:
                 print(f"Resample warning:dataset warning{fetch_iteration}, {e}")
-                #pass
             if resample:
                 idx = random.randint(0, len(self) - 1)
             else:
@@ -383,10 +440,10 @@ class BaseCalvinDataset(Dataset):
         
         seq_state_obs = process_state(
             episode, self.observation_space, self.transforms, self.proprio_state
-        )
-        seq_rgb_obs = self.process_rgb(episode, self.observation_space, self.transforms)
-        seq_depth_obs = process_depth(episode, self.observation_space, self.transforms)
-        seq_acts = process_actions(episode, self.observation_space, self.transforms)
+        )  # 保持不变，取episode['robot_obs']，并截取前15个
+        seq_rgb_obs = self.process_rgb(episode, self.observation_space, self.transforms)  # 执行self.transforms[rgb_obs_key]
+        seq_depth_obs = process_depth(episode, self.observation_space, self.transforms)  # 直接取depth
+        seq_acts = process_actions(episode, self.observation_space, self.transforms)  # 直接取rel_actions
         info = get_state_info_dict(episode)
         seq_calib_obs = self.process_calib(episode)
         seq_pcd_obs = self.process_pcd(episode)
@@ -403,7 +460,54 @@ class BaseCalvinDataset(Dataset):
             **seq_pcd_obs,
         }  # type:ignore
         seq_dict["idx"] = idx  # type:ignore
-
+        # 'robot_obs' =
+        # tensor([[-0.2471, -0.1064,  0.4983,  3.1055,  0.0572,  1.7654,  0.0405, -0.7534,
+        #         0.8667,  2.2012, -2.5975, -0.7346,  1.8360,  0.9573, -1.0000],
+        #         [-0.2430, -0.1086,  0.5053,  3.1127,  0.0481,  1.7694,  0.0405, -0.7696,
+        #         0.8897,  2.2128, -2.5932, -0.7307,  1.8190,  0.9407, -1.0000],
+        #         [-0.2374, -0.1108,  0.5122,  3.1193,  0.0386,  1.7716,  0.0405, -0.7866,
+        #         0.9118,  2.2220, -2.5871, -0.7281,  1.8022,  0.9227, -1.0000]])
+        # 'rgb_obs' =
+        # {'rgb_static': tensor([[[[1.4340, 1.4340, 1.4340,  ..., 1.9157, 1.9157, 1.9157],
+        #         [1.4340, ... 1.0367,  ..., 1.5913, 1.5913, 1.5913]]]]), 'rgb_gripper': tensor([[[[ 0.5435,  0.5435,  0.5435,  ...,  0.6895,  0.6895,  0.6895],
+        #         [ 0...2074,  ..., -0.5275, -0.5133, -0.5133]]]])}
+        # 'depth_obs' =
+        # {}
+        # 'actions' =
+        # tensor([[-0.1116, -0.2023,  0.3489,  0.1768, -0.1510,  0.0718, -1.0000],
+        #         [-0.1072, -0.2796,  0.3480,  0.1674, -0.1596,  0.0377, -1.0000],
+        #         [-0.1121, -0.2847,  0.3103,  0.1461, -0.1293,  0.0271, -1.0000]])
+        # 'state_info' =
+        # {'robot_obs': tensor([[-0.2471, -0.1064,  0.4983,  3.1055,  0.0572,  1.7654,  0.0405, -0.7534,
+        #     ...27, -1.0000]],
+        #     dtype=torch.float64), 'scene_obs': tensor([[ 2.5973e-01,  1.9946e-01,  1.4407e-19,  1.6662e-16,  0.0000e+00,
+        #         0...-1.7141e+00]],
+        #     dtype=torch.float64)}
+        # 'use_for_aux_lang_loss' =
+        # False
+        # 'lang' =
+        # 'grasp the red block, then lift it up'
+        # 'calib_obs' =
+        # {'static_extrinsic_matrix': tensor([[[ 0.7237,  0.5135, -0.4611,  0.2127],
+        #         [ 0.0299, -0.6909, -0.7224,  ...  0.0000,  1.0000]]], dtype=torch.float64), 'static_intrinsic_matrix': tensor([[[1.1430e+03, 0.0000e+00, 1.0000e+02],
+        #         [0.0000e+00, 1.1430e+03, 1.00...0e+00, 1.0000e+00]]], dtype=torch.float64), 'static_distCoeffs_matrix': tensor([[0., 0., 0., 0., 0., 0., 0., 0.],
+        #         [0., 0., 0., 0., 0., 0., 0., 0.],
+        # ...0., 0., 0., 0., 0.]], dtype=torch.float64), 'gripper_extrinsic_matrix': tensor([[[ 0.9802,  0.1949,  0.0356,  0.2449],
+        #         [ 0.1980, -0.9569, -0.2124, -...  0.0000,  1.0000]]], dtype=torch.float64), 'gripper_intrinsic_matrix': tensor([[[54.7355,  0.0000, 42.0000],
+        #         [ 0.0000, 54.7355, 42.0000],
+        #         ...  0.0000,  1.0000]]], dtype=torch.float64), 'gripper_distCoeffs_matrix': tensor([[0., 0., 0., 0., 0., 0., 0., 0.],
+        #         [0., 0., 0., 0., 0., 0., 0., 0.],
+        # ...0., 0., 0., 0., 0.]], dtype=torch.float64), 'state_matrix': tensor([[[ 0.9802,  0.1949,  0.0356,  0.2449],
+        # ...
+        # 'pcd_obs' =
+        # {'pcd': tensor([[[[[0., 0., 0., 0.],
+        #         [0., 0., 0., 0.],
+        #         [0., 0., 0., 0.]... 0., 0.],
+        #         [0., 0., 0., 0.]]]]])}
+        # 'idx' =
+        # 5462
+        # len() =
+        # 10
         return seq_dict
 
     def _load_episode(self, idx: int, window_size: int) -> Dict[str, np.ndarray]:
@@ -695,43 +799,48 @@ class BaseMultiDataset(BaseCalvinDataset):
         return info
 
     def _prepare_eposides(self, episodes):
-        
+        """
+        Build a single episode dict by fusing per-frame fields, computing point clouds,
+        optional color augmentation, and packing calibration matrices consistently.
+        """
         keys = list(chain(*self.observation_space.values()))
         keys.remove("language")
         keys.append("scene_obs")
+        # rgb handled separately
         keys.remove("rgb_static")
         keys.remove("rgb_gripper")
-        # keys_calib = ['static_extrinsic_matrix','static_intrinsic_matrix','static_distCoeffs_matrix',
-        #               'gripper_extrinsic_matrix','gripper_intrinsic_matrix','gripper_distCoeffs_matrix','state_matrix','static_fov', 'gripper_fov'] 
-        keys_rgb = ['rgb_static','rgb_gripper']
 
         calibs = []
         pcds = []
         rgbs = []
         colour_aug_random = random.randint(0, 10)
+        # Track color jitter state so both cameras receive identical transform per frame
+        jitter_state = None
+
         for i, ep in enumerate(episodes):
             rgb = {}
             calib = ep['calib']
             cam_config = ep['cam_config']
             static_extrinsic_matrix = calib['rgb_static']['extrinsic_matrix']
             gripper_extrinsic_matrix = calib['rgb_gripper']['extrinsic_matrix']
+
             static_cam = cam(static_extrinsic_matrix, cam_config['static']['height'], cam_config['static']['width'], cam_config['static']['fov'])
             gripper_cam = cam(gripper_extrinsic_matrix, cam_config['gripper']['height'], cam_config['gripper']['width'], cam_config['gripper']['fov'])
             static_pcd = deproject(static_cam, ep['depth_static'], homogeneous=False, sanity_check=False).transpose(1, 0)
             gripper_pcd = deproject(gripper_cam, ep['depth_gripper'], homogeneous=False, sanity_check=False).transpose(1, 0)
-            cloud = np.concatenate([static_pcd, gripper_pcd],axis=0)
-            rgb['rgb_static'] = ep['rgb_static'] # Image.fromarray(ep['rgb_static'])
-            rgb['rgb_gripper'] = ep['rgb_gripper'] # Image.fromarray(ep['rgb_gripper'])
-            if colour_aug_random>2 and self.use_colour_aug:
-                if i == 0: rgb['rgb_static'], fn_idx, brightness_factor, contrast_factor, saturation_factor, hue_factor = self.ColorJitter(rgb['rgb_static'])
-                else: rgb['rgb_static'], fn_idx, brightness_factor, contrast_factor, saturation_factor, hue_factor = self.ColorJitter(rgb['rgb_static'], fn_idx, brightness_factor, contrast_factor, saturation_factor, hue_factor)
-                rgb['rgb_gripper'], fn_idx, brightness_factor, contrast_factor, saturation_factor, hue_factor = self.ColorJitter(rgb['rgb_gripper'], fn_idx, brightness_factor, contrast_factor, saturation_factor, hue_factor)
-            # rgb['rgb_static'] = np.array(rgb['rgb_static'])
-            # rgb['rgb_gripper'] = np.array(rgb['rgb_gripper'])
+            cloud = np.concatenate([static_pcd, gripper_pcd], axis=0)
+
+            rgb['rgb_static'] = ep['rgb_static']
+            rgb['rgb_gripper'] = ep['rgb_gripper']
+
+            if colour_aug_random > 2 and self.use_colour_aug:
+                rgb['rgb_static'], rgb['rgb_gripper'], jitter_state = apply_color_jitter_pair(
+                    self.ColorJitter, rgb['rgb_static'], rgb['rgb_gripper'], jitter_state
+                )
+
             static_rgb = np.reshape(np.array(rgb['rgb_static']), (-1, 3))
-            gripper_rgb =  np.reshape(np.array(rgb['rgb_gripper']), (-1, 3))
-            pcd_rgb = np.concatenate([static_rgb, gripper_rgb], axis=0)
-            pcd_rgb = pcd_rgb/255
+            gripper_rgb = np.reshape(np.array(rgb['rgb_gripper']), (-1, 3))
+            pcd_rgb = np.concatenate([static_rgb, gripper_rgb], axis=0) / 255
             pcd = self.vfe_generator.generate(cloud[:, :3], pcd_rgb)
             if 0:
                 _pcd = o3d.geometry.PointCloud()
@@ -745,149 +854,26 @@ class BaseMultiDataset(BaseCalvinDataset):
                 _pcd.points = o3d.utility.Vector3dVector(gripper_pcd)
                 _pcd.colors = o3d.utility.Vector3dVector(gripper_rgb/255)
                 o3d.io.write_point_cloud("tmp2.pcd", _pcd)
-            calib['static_extrinsic_matrix'] = static_extrinsic_matrix * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
+            
+            calib['static_extrinsic_matrix'] = static_extrinsic_matrix * SIGN_FLIP_4X4
             calib['static_intrinsic_matrix'] = calib['rgb_static']['intrinsic_matrix']
             calib['static_distCoeffs_matrix'] = calib['rgb_static']['distCoeffs_matrix']
-            calib['gripper_extrinsic_matrix'] = gripper_extrinsic_matrix * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
+            calib['gripper_extrinsic_matrix'] = gripper_extrinsic_matrix * SIGN_FLIP_4X4
             calib['gripper_intrinsic_matrix'] = calib['rgb_gripper']['intrinsic_matrix']
             calib['gripper_distCoeffs_matrix'] = calib['rgb_gripper']['distCoeffs_matrix']
-            calib['state_matrix'] = ep['state_matrix'] * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
-            calib['gripper_cam2gripper'] = ep['gripper_cam2gripper'] * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
+            calib['state_matrix'] = ep['state_matrix'] * SIGN_FLIP_4X4
+            calib['gripper_cam2gripper'] = ep['gripper_cam2gripper'] * SIGN_FLIP_4X4
             calib['static_fov'] = np.array([cam_config['static']['fov'], cam_config['static']['height'], cam_config['static']['width']])
             calib['gripper_fov'] = np.array([cam_config['gripper']['fov'], cam_config['gripper']['height'], cam_config['gripper']['width']])
             rgbs.append(rgb)
             pcds.append(pcd)
             calibs.append(calib)
+
         episode = {key: np.stack([ep[key] for ep in episodes]) for key in keys}
         episode.update({key: np.stack([calib[key] for calib in calibs]) for key in keys_calib})
-        episode.update({key: [rgb[key] for rgb in rgbs] for key in keys_rgb}) # episode.update({key: np.stack([rgb[key] for rgb in rgbs]) for key in keys_rgb})
+        episode.update({key: [rgb[key] for rgb in rgbs] for key in RGB_KEYS})
         episode['pcd'] = np.stack(pcds)
-        
         return episode
-
-    # def _prepare_eposides(self, episodes):
-        
-    #     keys = list(chain(*self.observation_space.values()))
-    #     keys.remove("language")
-    #     keys.append("scene_obs")
-    #     keys.remove("rgb_static")
-    #     keys.remove("rgb_gripper")
-    #     # keys_calib = ['static_extrinsic_matrix','static_intrinsic_matrix','static_distCoeffs_matrix',
-    #     #               'gripper_extrinsic_matrix','gripper_intrinsic_matrix','gripper_distCoeffs_matrix','state_matrix','static_fov', 'gripper_fov'] 
-    #     keys_rgb = ['rgb_static','rgb_gripper']
-
-    #     calibs = []
-    #     pcds = []
-    #     rgbs = []
-    #     ColorJitter_func = None
-    #     colour_aug_random = random.randint(0, 10)
-    #     # i=0
-    #     if 1:
-    #         ep = episodes[0]
-    #         rgb = {}
-    #         calib = ep['calib']
-    #         cam_config = ep['cam_config']
-    #         static_extrinsic_matrix = calib['rgb_static']['extrinsic_matrix']
-    #         gripper_extrinsic_matrix = calib['rgb_gripper']['extrinsic_matrix']
-    #         static_cam = cam(static_extrinsic_matrix, cam_config['static']['height'], cam_config['static']['width'], cam_config['static']['fov'])
-    #         gripper_cam = cam(gripper_extrinsic_matrix, cam_config['gripper']['height'], cam_config['gripper']['width'], cam_config['gripper']['fov'])
-    #         static_pcd = deproject(static_cam, ep['depth_static'], homogeneous=False, sanity_check=False).transpose(1, 0)
-    #         gripper_pcd = deproject(gripper_cam, ep['depth_gripper'], homogeneous=False, sanity_check=False).transpose(1, 0)
-    #         cloud = np.concatenate([static_pcd, gripper_pcd],axis=0)
-    #         rgb['rgb_static'] = ep['rgb_static'] # Image.fromarray(ep['rgb_static'])
-    #         rgb['rgb_gripper'] = ep['rgb_gripper'] # Image.fromarray(ep['rgb_gripper'])
-    #         if colour_aug_random>2 and self.use_colour_aug:
-    #             rgb['rgb_static'], fn_idx, brightness_factor, contrast_factor, saturation_factor, hue_factor = self.ColorJitter(rgb['rgb_static'])
-    #             rgb['rgb_gripper'], fn_idx, brightness_factor, contrast_factor, saturation_factor, hue_factor = self.ColorJitter(rgb['rgb_gripper'], fn_idx, brightness_factor, contrast_factor, saturation_factor, hue_factor)
-    #             ColorJitter_func = lambda: x, self.ColorJitter(x, fn_idx, brightness_factor, contrast_factor, saturation_factor, hue_factor)
-    #         static_rgb = np.reshape(np.array(rgb['rgb_static']), (-1, 3))
-    #         gripper_rgb =  np.reshape(np.array(rgb['rgb_gripper']), (-1, 3))
-    #         pcd_rgb = np.concatenate([static_rgb, gripper_rgb], axis=0)
-    #         pcd_rgb = pcd_rgb/255
-    #         pcd = self.vfe_generator.generate(cloud[:, :3], pcd_rgb)
-    #         if 0:
-    #             _pcd = o3d.geometry.PointCloud()
-    #             point_tmp, rgb_tmp = self.vfe_generator.decode_occupied_grid_with_range(pcd)
-    #             _pcd.points = o3d.utility.Vector3dVector(point_tmp)
-    #             _pcd.colors = o3d.utility.Vector3dVector(rgb_tmp)
-    #             o3d.io.write_point_cloud("tmp.pcd", _pcd)
-    #             _pcd.points = o3d.utility.Vector3dVector(static_pcd)
-    #             _pcd.colors = o3d.utility.Vector3dVector(static_rgb/255)
-    #             o3d.io.write_point_cloud("tmp1.pcd", _pcd)
-    #             _pcd.points = o3d.utility.Vector3dVector(gripper_pcd)
-    #             _pcd.colors = o3d.utility.Vector3dVector(gripper_rgb/255)
-    #             o3d.io.write_point_cloud("tmp2.pcd", _pcd)
-    #         calib['static_extrinsic_matrix'] = static_extrinsic_matrix * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
-    #         calib['static_intrinsic_matrix'] = calib['rgb_static']['intrinsic_matrix']
-    #         calib['static_distCoeffs_matrix'] = calib['rgb_static']['distCoeffs_matrix']
-    #         calib['gripper_extrinsic_matrix'] = gripper_extrinsic_matrix * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
-    #         calib['gripper_intrinsic_matrix'] = calib['rgb_gripper']['intrinsic_matrix']
-    #         calib['gripper_distCoeffs_matrix'] = calib['rgb_gripper']['distCoeffs_matrix']
-    #         calib['state_matrix'] = ep['state_matrix'] * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
-    #         calib['static_fov'] = np.array([cam_config['static']['fov'], cam_config['static']['height'], cam_config['static']['width']])
-    #         calib['gripper_fov'] = np.array([cam_config['gripper']['fov'], cam_config['gripper']['height'], cam_config['gripper']['width']])
-    #         rgbs.append(rgb)
-    #         pcds.append(pcd)
-    #         calibs.append(calib)
-
-    #     def _func(ep, ColorJitter_func=None):
-    #         rgb = {}
-    #         calib = ep['calib']
-    #         cam_config = ep['cam_config']
-    #         static_extrinsic_matrix = calib['rgb_static']['extrinsic_matrix']
-    #         gripper_extrinsic_matrix = calib['rgb_gripper']['extrinsic_matrix']
-    #         static_cam = cam(static_extrinsic_matrix, cam_config['static']['height'], cam_config['static']['width'], cam_config['static']['fov'])
-    #         gripper_cam = cam(gripper_extrinsic_matrix, cam_config['gripper']['height'], cam_config['gripper']['width'], cam_config['gripper']['fov'])
-    #         static_pcd = deproject(static_cam, ep['depth_static'], homogeneous=False, sanity_check=False).transpose(1, 0)
-    #         gripper_pcd = deproject(gripper_cam, ep['depth_gripper'], homogeneous=False, sanity_check=False).transpose(1, 0)
-    #         cloud = np.concatenate([static_pcd, gripper_pcd],axis=0)
-    #         rgb['rgb_static'] = ep['rgb_static'] # Image.fromarray(ep['rgb_static'])
-    #         rgb['rgb_gripper'] = ep['rgb_gripper'] # Image.fromarray(ep['rgb_gripper'])
-    #         if ColorJitter_func is not None:
-    #             rgb['rgb_static'], *_ = ColorJitter_func(rgb['rgb_static'])
-    #             rgb['rgb_gripper'], *_ = ColorJitter_func(rgb['rgb_gripper'])
-    #         static_rgb = np.reshape(np.array(rgb['rgb_static']), (-1, 3))
-    #         gripper_rgb =  np.reshape(np.array(rgb['rgb_gripper']), (-1, 3))
-    #         pcd_rgb = np.concatenate([static_rgb, gripper_rgb], axis=0)
-    #         pcd_rgb = pcd_rgb/255
-    #         pcd = self.vfe_generator.generate(cloud[:, :3], pcd_rgb)
-    #         if 0:
-    #             _pcd = o3d.geometry.PointCloud()
-    #             point_tmp, rgb_tmp = self.vfe_generator.decode_occupied_grid_with_range(pcd)
-    #             _pcd.points = o3d.utility.Vector3dVector(point_tmp)
-    #             _pcd.colors = o3d.utility.Vector3dVector(rgb_tmp)
-    #             o3d.io.write_point_cloud("tmp.pcd", _pcd)
-    #             _pcd.points = o3d.utility.Vector3dVector(static_pcd)
-    #             _pcd.colors = o3d.utility.Vector3dVector(static_rgb/255)
-    #             o3d.io.write_point_cloud("tmp1.pcd", _pcd)
-    #             _pcd.points = o3d.utility.Vector3dVector(gripper_pcd)
-    #             _pcd.colors = o3d.utility.Vector3dVector(gripper_rgb/255)
-    #             o3d.io.write_point_cloud("tmp2.pcd", _pcd)
-    #         calib['static_extrinsic_matrix'] = static_extrinsic_matrix * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
-    #         calib['static_intrinsic_matrix'] = calib['rgb_static']['intrinsic_matrix']
-    #         calib['static_distCoeffs_matrix'] = calib['rgb_static']['distCoeffs_matrix']
-    #         calib['gripper_extrinsic_matrix'] = gripper_extrinsic_matrix * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
-    #         calib['gripper_intrinsic_matrix'] = calib['rgb_gripper']['intrinsic_matrix']
-    #         calib['gripper_distCoeffs_matrix'] = calib['rgb_gripper']['distCoeffs_matrix']
-    #         calib['state_matrix'] = ep['state_matrix'] * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
-    #         calib['static_fov'] = np.array([cam_config['static']['fov'], cam_config['static']['height'], cam_config['static']['width']])
-    #         calib['gripper_fov'] = np.array([cam_config['gripper']['fov'], cam_config['gripper']['height'], cam_config['gripper']['width']])
-            
-    #         return rgb, pcd, calib
-
-    #     partial_process_sample = functools.partial(_func, ColorJitter_func=ColorJitter_func)
-    #     with ThreadPoolExecutor() as executor:
-    #         results = list(executor.map(partial_process_sample, ['text', 'occ', 'static', 'gripper']))
-    #     for rgb, pcd, calib in results:
-    #         rgbs.append(rgb)
-    #         pcds.append(pcd)
-    #         calibs.append(calib)
-    #     episode = {key: np.stack([ep[key] for ep in episodes]) for key in keys}
-    #     episode.update({key: np.stack([calib[key] for calib in calibs]) for key in keys_calib})
-    #     episode.update({key: [rgb[key] for rgb in rgbs] for key in keys_rgb}) # episode.update({key: np.stack([rgb[key] for rgb in rgbs]) for key in keys_rgb})
-    #     episode['pcd'] = np.stack(pcds)
-        
-    #     return episode
 
 
 class DiskCalvinDataset(BaseMultiDataset):
@@ -969,13 +955,13 @@ class DiskCalvinDataset(BaseMultiDataset):
 
         episode = self.load_file(self._get_episode_name_split(file_idx, data_path))
         episode = {key: episode[key] for key in episode}
-        state_matrix = self.load_file(self._get_episode_name_split(file_idx, self.state_matrixs_path))
-        state_matrix = state_matrix['calib'].item()
-        state_matrix = state_matrix['rgb_gripper']['extrinsic_matrix']
+        # state_matrix = self.load_file(self._get_episode_name_split(file_idx, self.state_matrixs_path))
+        # state_matrix = state_matrix['calib'].item()
+        # state_matrix = state_matrix['rgb_gripper']['extrinsic_matrix']
 
         episode['rgb_static'] = Image.fromarray(episode['rgb_static'])
         episode['rgb_gripper'] = Image.fromarray(episode['rgb_gripper'])
-        episode['state_matrix'] = state_matrix
+        episode['state_matrix'] = episode['calib'].item()['rgb_gripper']['extrinsic_matrix'] #  state_matrix
         episode['calib'] = episode['calib'].item()
         episode['cam_config'] = episode['cam_config'].item()
         # episode['gripper_cam2gripper'] = np.array([[-7.96325957e-04, 9.99999676e-01, 6.63332084e-09, -7.96272678e-05],
@@ -1113,12 +1099,12 @@ class DiskCalvinDataset(BaseMultiDataset):
         lang_ann = lang_data["language"]["ann"]  # length total number of annotations
         lang_task = lang_data["language"]["task"] 
         lang_lookup = []
-        partial_st_ed_list = load_partial_traj_data()
+        # partial_st_ed_list = load_partial_traj_data()
         for i, (start_idx, end_idx) in enumerate(ep_start_end_ids):
             if self.only_single_task and "rotate_blue_block_right" not in lang_task[i]: continue # 仅测试使用
-            if self.partial_data:
-                if (start_idx, end_idx) not in partial_st_ed_list:
-                    continue
+            # if self.partial_data:
+            #     if (start_idx, end_idx) not in partial_st_ed_list:
+            #         continue
             if self.pretrain: 
                 start_idx = max(
                     start_idx,
@@ -1203,16 +1189,16 @@ class DiskMetaWorldDataset(BaseMultiDataset):
         calib2 = np.load(os.path.join(zip_file, os.path.join('rgb', "behindGripper", f'config_save_{file_idx}.npy')), allow_pickle=True).item()
         rgb = rgb.transpose(Image.FLIP_TOP_BOTTOM) # rgb = np.flip(rgb, axis=0) # 注意此处需要添加flip
         rgb2 = rgb2.transpose(Image.FLIP_TOP_BOTTOM) # rgb2 = np.flip(rgb2, axis=0)
-        def depthimg2Meters(depth, cam):
-            extent =cam['cam_config']['extent']
-            near = cam['cam_config']['nearval'] * extent
-            far = cam['cam_config']['farval'] * extent
-            image = near / (1 - depth * (1 - near / far))
-            return image
+        # Convert depth using OpenGL-style mapping (scaled by extent)
+        extent = calib['cam_config']['extent']
+        near = calib['cam_config']['nearval'] * extent
+        far = calib['cam_config']['farval'] * extent
         rgb_depth = np.flip(rgb_depth, axis=0)
-        rgb_depth = depthimg2Meters(rgb_depth, calib)
+        rgb_depth = depth_to_meters(rgb_depth, near, far, mode="gl")
         rgb2_depth = np.flip(rgb2_depth, axis=0)
-        rgb2_depth = depthimg2Meters(rgb2_depth, calib2)
+        near2 = calib2['cam_config']['nearval'] * extent
+        far2 = calib2['cam_config']['farval'] * extent
+        rgb2_depth = depth_to_meters(rgb2_depth, near2, far2, mode="gl")
         calib['extrinsic_matrix'] = np.linalg.inv(calib['extrinsic_matrix']) * np.array([[1,1,1,1], [-1,-1,-1,-1], [-1,-1,-1,-1], [1,1,1,1]]) # 主要原因是deproject，对YZ加了一个符号
         calib2['extrinsic_matrix'] = np.linalg.inv(calib2['extrinsic_matrix']) * np.array([[1,1,1,1], [-1,-1,-1,-1], [-1,-1,-1,-1], [1,1,1,1]])
         T_translate = np.array([[1, 0, 0, 0],   # [-0.5038039  -0.10849035  0.12061001  1.        ] [0.48056049 0.41590198 0.60125949 1.        ]
@@ -1353,8 +1339,8 @@ class DiskLiberoDataset(BaseMultiDataset):
         # action = np.array([-action[1], action[0], action[2], -action[4], action[3], action[5], action[6]])  # 对齐坐标系[-1, 0,2,-4,3,5,6]
         agentview = episode['agentview'].item()
         robot0_eye_in_hand = episode['robot0_eye_in_hand'].item()
-        agentview['calib']['extrinsic_matrix'] = np.linalg.inv(agentview['calib']['extrinsic_matrix'])*np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])  # 主要原因是deproject，对YZ加了一个符号
-        robot0_eye_in_hand['calib']['extrinsic_matrix'] = np.linalg.inv(robot0_eye_in_hand['calib']['extrinsic_matrix'])*np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
+        agentview['calib']['extrinsic_matrix'] = np.linalg.inv(agentview['calib']['extrinsic_matrix']) * SIGN_FLIP_4X4  # 主要原因是deproject，对YZ加了一个符号
+        robot0_eye_in_hand['calib']['extrinsic_matrix'] = np.linalg.inv(robot0_eye_in_hand['calib']['extrinsic_matrix']) * SIGN_FLIP_4X4
         # 由于不同任务世界坐标系不同，这里使用本体坐标统一世界坐标系到本体上。
         base_pose = posRotMat2Mat(episode['base_p'], rotMatList2NPRotMat(episode['base_r']))
         agentview['calib']['extrinsic_matrix'] = np.dot(agentview['calib']['extrinsic_matrix'], base_pose)
@@ -1368,12 +1354,7 @@ class DiskLiberoDataset(BaseMultiDataset):
         ])
         agentview['calib']['extrinsic_matrix'] = np.dot(agentview['calib']['extrinsic_matrix'], T_translate)
         robot0_eye_in_hand['calib']['extrinsic_matrix'] = np.dot(robot0_eye_in_hand['calib']['extrinsic_matrix'], T_translate) # 为了与calvin点云坐标对齐
-        R = np.array([
-            [0, 1, 0, 0],
-            [-1,  0, 0, 0],
-            [0,  0, 1, 0],
-            [0,  0, 0, 1],
-        ])
+        R = AXIS_SWAP_R
         agentview['calib']['extrinsic_matrix']=np.dot(agentview['calib']['extrinsic_matrix'], R)
         robot0_eye_in_hand['calib']['extrinsic_matrix'] = np.dot(robot0_eye_in_hand['calib']['extrinsic_matrix'], R) # 往前为X轴；往左为Y轴；往上为Z轴,需转为往右为X轴；往前为Y轴；往上为Z轴
         # gripper_cam2gripper = np.array([[1.73745673e-06, 1.00000000e+00, 4.98534343e-06, -9.65734593e-05],
@@ -1510,18 +1491,17 @@ class DiskRobocasaDataset(BaseMultiDataset):
         calib2 = np.load(os.path.join(zip_file, os.path.join('rgb', "robot0_eye_in_hand", 'config_save_' + str(file_idx) + ".npy")), allow_pickle=True).item()
         rgb = rgb.transpose(Image.FLIP_TOP_BOTTOM) # rgb = np.flip(np.array(rgb), axis=0 # 注意此处需要添加flip
         rgb2 = rgb2.transpose(Image.FLIP_TOP_BOTTOM) # rgb2 = np.flip(np.array(rgb2), axis=0)
-        def depthimg2Meters(depth, cam):
-            extent =cam['cam_config']['extent']
-            near = cam['cam_config']['nearval'] * extent
-            far = cam['cam_config']['farval'] * extent
-            image = near / (1 - depth * (1 - near / far))
-            return image
+        extent = calib['cam_config']['extent']
+        near = calib['cam_config']['nearval'] * extent
+        far = calib['cam_config']['farval'] * extent
         rgb_depth = np.flip(rgb_depth, axis=0)
-        rgb_depth = depthimg2Meters(rgb_depth, calib)
+        rgb_depth = depth_to_meters(rgb_depth, near, far, mode="gl")
         rgb2_depth = np.flip(rgb2_depth, axis=0)
-        rgb2_depth = depthimg2Meters(rgb2_depth, calib2)
-        calib['extrinsic_matrix'] = np.linalg.inv(calib['extrinsic_matrix']) * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
-        calib2['extrinsic_matrix'] = np.linalg.inv(calib2['extrinsic_matrix']) * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]]) # 主要原因是deproject，对YZ加了一个符号
+        near2 = calib2['cam_config']['nearval'] * extent
+        far2 = calib2['cam_config']['farval'] * extent
+        rgb2_depth = depth_to_meters(rgb2_depth, near2, far2, mode="gl")
+        calib['extrinsic_matrix'] = np.linalg.inv(calib['extrinsic_matrix']) * SIGN_FLIP_4X4
+        calib2['extrinsic_matrix'] = np.linalg.inv(calib2['extrinsic_matrix']) * SIGN_FLIP_4X4 # 主要原因是deproject，对YZ加了一个符号
         # 由于不同任务世界坐标系不同，这里使用本体坐标统一世界坐标系到本体上。
         calib['extrinsic_matrix'] = np.dot(calib['extrinsic_matrix'], base_extrinsic)
         calib2['extrinsic_matrix'] = np.dot(calib2['extrinsic_matrix'], base_extrinsic)
@@ -1534,12 +1514,7 @@ class DiskRobocasaDataset(BaseMultiDataset):
         ])
         calib['extrinsic_matrix'] = np.dot(calib['extrinsic_matrix'], T_translate)
         calib2['extrinsic_matrix'] = np.dot(calib2['extrinsic_matrix'], T_translate) # 为了与calvin点云坐标对齐
-        R = np.array([
-            [0, 1, 0, 0],
-            [-1,  0, 0, 0],
-            [0,  0, 1, 0],
-            [0,  0, 0, 1],
-        ])
+        R = AXIS_SWAP_R
         calib['extrinsic_matrix']=np.dot(calib['extrinsic_matrix'], R)
         calib2['extrinsic_matrix'] = np.dot(calib2['extrinsic_matrix'], R) # 往前为X轴；往左为Y轴；往上为Z轴,需转为往右为X轴；往前为Y轴；往上为Z轴
         # gripper_cam2gripper = np.array([[-1.26022068e-16, 1.00000000e+00, -1.58006978e-16, -9.02557353e-18],
@@ -1668,8 +1643,8 @@ class DiskRoboMimicDataset(BaseMultiDataset):
         depth_gripper = np.squeeze(frames["obs"]['robot0_eye_in_hand_depth'][file_idx][()])
         camera_info = cam_infos[f"{file_idx}"]
 
-        static_extrinsic_matrix = np.linalg.inv(np.array(camera_info["agentview"]['extrinsics'])) * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])   #注意这里没有求逆
-        gripper_extrinsic_matrix = np.linalg.inv(np.array(camera_info['robot0_eye_in_hand']['fix_extrinsics'])) * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]]) # 主要原因是deproject，对YZ加了一个符号 #注意这里没有求逆
+        static_extrinsic_matrix = np.linalg.inv(np.array(camera_info["agentview"]['extrinsics'])) * SIGN_FLIP_4X4   #注意这里没有求逆
+        gripper_extrinsic_matrix = np.linalg.inv(np.array(camera_info['robot0_eye_in_hand']['fix_extrinsics'])) * SIGN_FLIP_4X4 # 主要原因是deproject，对YZ加了一个符号 #注意这里没有求逆
         T_translate = np.array([
             [1, 0, 0, 0],
             [0, 1, 0, 0],
@@ -1678,12 +1653,7 @@ class DiskRoboMimicDataset(BaseMultiDataset):
         ])
         static_extrinsic_matrix = np.dot(static_extrinsic_matrix, T_translate)
         gripper_extrinsic_matrix = np.dot(gripper_extrinsic_matrix, T_translate) # 为了与calvin点云坐标对齐
-        R = np.array([
-            [0, 1, 0, 0],
-            [-1,  0, 0, 0],
-            [0,  0, 1, 0],
-            [0,  0, 0, 1],
-        ])
+        R = AXIS_SWAP_R
         static_extrinsic_matrix=np.dot(static_extrinsic_matrix, R)
         gripper_extrinsic_matrix = np.dot(gripper_extrinsic_matrix, R) # 往前为X轴；往左为Y轴；往上为Z轴,需转为往右为X轴；往前为Y轴；往上为Z轴
         calib = {}
@@ -1812,78 +1782,6 @@ class DiskManiSkill2Dataset(BaseMultiDataset):
         else:
             self.episode_lookup = self._build_file_indices(self.abs_datasets_dir)
 
-    # def _get_episode(self, file_idx, frames): 
-    #     from scipy.spatial.transform import Rotation as R
-    #     def base_pose_to_matrix(base_pose):
-    #         position = base_pose[:3] # 提取位置和四元数
-    #         orientation = base_pose[3:]
-    #         rotation = R.from_quat(orientation).as_matrix() # 将四元数转换为旋转矩阵
-    #         transform_matrix = np.eye(4) # 创建4x4的同质变换矩阵
-    #         transform_matrix[:3, :3] = rotation
-    #         transform_matrix[:3, 3] = position
-    #         return transform_matrix
-
-    #     action = frames["actions"][file_idx][()]
-    #     action = np.array([action[1], action[0], -action[2], action[4], action[3], -action[5], action[6]])  # 对齐坐标系[1, 0,-2,4,3,-5,6]
-
-    #     rgb_static = frames["obs"]["image"]["base_camera"]["rgb"][file_idx][()]
-    #     rgb_gripper = frames["obs"]["image"]["hand_camera"]["rgb"][file_idx][()]
-    #     depth_static = np.squeeze(frames["obs"]["image"]["base_camera"]["depth"][file_idx][()])
-    #     depth_gripper = np.squeeze(frames["obs"]["image"]["hand_camera"]["depth"][file_idx][()])
-    #     static_extrinsic_matrix = frames["obs"]["camera_param"]["base_camera"]['extrinsic_cv'][file_idx][()] * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])   # 主要原因是deproject，对YZ加了一个符号 #注意这里没有求逆
-    #     gripper_extrinsic_matrix = frames["obs"]["camera_param"]["hand_camera"]['extrinsic_cv'][file_idx][()] * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
-    #     # 由于不同任务世界坐标系不同，这里使用本体坐标统一世界坐标系到本体上。
-    #     base_pose = base_pose_to_matrix(frames['obs']['agent']['base_pose'][file_idx][()])
-    #     static_extrinsic_matrix = np.dot(static_extrinsic_matrix, base_pose)
-    #     gripper_extrinsic_matrix = np.dot(gripper_extrinsic_matrix, base_pose)
-    #     # 平移矩阵 T_translate 待修改
-    #     T_translate = np.array([
-    #         [1, 0, 0, 0.3],
-    #         [0, 1, 0, 0.0],
-    #         [0, 0, 1, 0.0], # [-0.2615632  -0.79399014 -1.17142143  1. ] [8.50e-01 7.642e-01 8.9469e-04 1.00e+00]
-    #         [0, 0, 0, 1]
-    #     ])
-    #     static_extrinsic_matrix = np.dot(static_extrinsic_matrix, T_translate)
-    #     gripper_extrinsic_matrix = np.dot(gripper_extrinsic_matrix, T_translate) # 为了与calvin点云坐标对齐
-    #     R = np.array([
-    #         [0, 1, 0, 0],
-    #         [1,  0, 0, 0],
-    #         [0,  0, -1, 0],
-    #         [0,  0, 0, 1],
-    #     ])
-    #     static_extrinsic_matrix=np.dot(static_extrinsic_matrix, R)
-    #     gripper_extrinsic_matrix = np.dot(gripper_extrinsic_matrix, R) # 往前为X轴；往右为Y轴；往下为Z轴,需转为往右为X轴；往前为Y轴；往上为Z轴
-    #     calib = {'rgb_static': {'extrinsic_matrix': static_extrinsic_matrix,         
-    #                             'intrinsic_matrix': frames["obs"]["camera_param"]["base_camera"]["intrinsic_cv"][file_idx][()],
-    #                             'distCoeffs_matrix': np.array([0.0, 0.0, 0.0, 0.0, 0.0,0.0,0.0,0.0,])},
-    #             'rgb_gripper': {'extrinsic_matrix': gripper_extrinsic_matrix,
-    #                             'intrinsic_matrix': frames["obs"]["camera_param"]["hand_camera"]["intrinsic_cv"][file_idx][()],
-    #                             'distCoeffs_matrix': np.array([0.0, 0.0, 0.0, 0.0, 0.0,0.0,0.0,0.0,])}}
-    #     def calculate_fov(intrinsic_matrix, image_width):
-    #         fx = intrinsic_matrix[0, 0]
-    #         fov = 2 * np.arctan(image_width / (2 * fx)) * 180 / np.pi
-    #         return fov
-    #     cam_config = {'static':{'height': rgb_static.shape[0],
-    #                             'width': rgb_static.shape[1],
-    #                             'fov': calculate_fov(frames["obs"]["camera_param"]["base_camera"]["intrinsic_cv"][file_idx][()], rgb_static.shape[0])}, #90
-    #                  'gripper':{'height': rgb_gripper.shape[0],
-    #                             'width': rgb_gripper.shape[1],
-    #                             'fov': calculate_fov(frames["obs"]["camera_param"]["hand_camera"]["intrinsic_cv"][file_idx][()], rgb_gripper.shape[0])}}
-    #     # joints = frames["obs"]["agent"]["base_pose"][file_idx]
-        
-    #     return {
-    #         "rgb_static": Image.fromarray(rgb_static),
-    #         "rgb_gripper": Image.fromarray(rgb_gripper),
-    #         "depth_static": depth_static / 1000,
-    #         "depth_gripper": depth_gripper/ 1000, # 单位mm
-    #         "rel_actions": action,
-    #         "robot_obs": np.zeros(20),
-    #         "scene_obs": np.zeros(20),
-    #         "calib": calib,
-    #         "cam_config": cam_config,
-    #         "state_matrix": gripper_extrinsic_matrix,  # 注意此处是爪子矩阵
-    #     }
-
     def _get_episode(self, start_idx, end_idx, frames): 
         from scipy.spatial.transform import Rotation as R
         def base_pose_to_matrix(base_pose):
@@ -1906,8 +1804,8 @@ class DiskManiSkill2Dataset(BaseMultiDataset):
         if len(depth_static.shape) == 2:
             depth_static = depth_static[None]
             depth_gripper = depth_gripper[None]
-        static_extrinsic_matrix = frames["obs"]["camera_param"]["base_camera"]['extrinsic_cv'][start_idx:end_idx][()] * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])   # 主要原因是deproject，对YZ加了一个符号 #注意这里没有求逆
-        gripper_extrinsic_matrix = frames["obs"]["camera_param"]["hand_camera"]['extrinsic_cv'][start_idx:end_idx][()] * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
+        static_extrinsic_matrix = frames["obs"]["camera_param"]["base_camera"]['extrinsic_cv'][start_idx:end_idx][()] * SIGN_FLIP_4X4   # 主要原因是deproject，对YZ加了一个符号 #注意这里没有求逆
+        gripper_extrinsic_matrix = frames["obs"]["camera_param"]["hand_camera"]['extrinsic_cv'][start_idx:end_idx][()] * SIGN_FLIP_4X4
         # 由于不同任务世界坐标系不同，这里使用本体坐标统一世界坐标系到本体上。
         base_pose = base_pose_to_matrix(frames['obs']['agent']['base_pose'][start_idx:end_idx][()])
         static_extrinsic_matrix = np.einsum('mij,mjk->mik', static_extrinsic_matrix, base_pose)
@@ -2101,10 +1999,7 @@ class DiskRlbenchDataset(BaseMultiDataset):
         action = np.array([-action[1], action[0], action[2], -action[4], action[3], action[5], action[6]])  # 对齐坐标系[-1, 0,2,-4,3,5,6]
         rgb = Image.open(episodes_dir/f"front_rgb/{file_idx}.png")
         rgb2 = Image.open(episodes_dir/f"wrist_rgb/{file_idx}.png")
-        def calculate_fov(intrinsic_matrix, image_width):
-            fx = intrinsic_matrix[0, 0]
-            fov = 2 * np.arctan(image_width / (2 * fx)) * 180 / np.pi
-            return fov
+        # FOV from intrinsics
         def image_to_float_array(image, scale_factor): 
             image_array = np.array(image)
             assert 2 <= image_array.ndim <= 3, "Image must be either 2D or 3D array."
@@ -2120,21 +2015,16 @@ class DiskRlbenchDataset(BaseMultiDataset):
             
             scaled_array = float_array / scale_factor
             return scaled_array
-        static_cam_config = {"width": rgb.width, "height": rgb.height, "fov": calculate_fov(frames[file_idx].misc['front_camera_intrinsics'], rgb.height), "nearval": frames[file_idx].misc['front_camera_near'], "farval":  frames[file_idx].misc['front_camera_far']}
-        gripper_cam_config = {"width": rgb2.width, "height": rgb2.height, "fov": calculate_fov(frames[file_idx].misc['wrist_camera_intrinsics'], rgb2.height), "nearval": frames[file_idx].misc['wrist_camera_near'], "farval":  frames[file_idx].misc['wrist_camera_far']}
+        static_cam_config = {"width": rgb.width, "height": rgb.height, "fov": compute_fov_from_intrinsics(frames[file_idx].misc['front_camera_intrinsics'], rgb.height), "nearval": frames[file_idx].misc['front_camera_near'], "farval":  frames[file_idx].misc['front_camera_far']}
+        gripper_cam_config = {"width": rgb2.width, "height": rgb2.height, "fov": compute_fov_from_intrinsics(frames[file_idx].misc['wrist_camera_intrinsics'], rgb2.height), "nearval": frames[file_idx].misc['wrist_camera_near'], "farval":  frames[file_idx].misc['wrist_camera_far']}
         depth_static = image_to_float_array(Image.open(episodes_dir/f"front_depth/{file_idx}.png"), 16777215)
         depth_gripper = image_to_float_array(Image.open(episodes_dir/f"wrist_depth/{file_idx}.png"), 16777215)
-        def depthimg2Meters(depth, cam):
-            near = cam['cam_config']['nearval']
-            far = cam['cam_config']['farval']
-            image = near + depth * (far - near)
-            return image
-        depth_static = depthimg2Meters(depth_static, {"cam_config": static_cam_config})
-        depth_gripper = depthimg2Meters(depth_gripper, {"cam_config": gripper_cam_config})
+        depth_static = depth_to_meters(depth_static, static_cam_config['nearval'], static_cam_config['farval'], mode="linear")
+        depth_gripper = depth_to_meters(depth_gripper, gripper_cam_config['nearval'], gripper_cam_config['farval'], mode="linear")
         static_extrinsic_matrix = frames[file_idx].misc['front_camera_extrinsics']
         gripper_extrinsic_matrix = frames[file_idx].misc['wrist_camera_extrinsics']
-        static_extrinsic_matrix = np.linalg.inv(static_extrinsic_matrix) * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]]) # 单位矩阵的逆和转置是一样的
-        gripper_extrinsic_matrix = np.linalg.inv(gripper_extrinsic_matrix) * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]]) # 主要原因是deproject，对YZ加了一个符号
+        static_extrinsic_matrix = np.linalg.inv(static_extrinsic_matrix) * SIGN_FLIP_4X4 # 单位矩阵的逆和转置是一样的
+        gripper_extrinsic_matrix = np.linalg.inv(gripper_extrinsic_matrix) * SIGN_FLIP_4X4 # 主要原因是deproject，对YZ加了一个符号
         # 平移矩阵 T_translate
         T_translate = np.array([
             [1, 0, 0, 0.0], #  [ 0.016149   -0.3464728   0.84676421  1.        ] [0.47925746 0.38417864 1.57344687 1.        ]
@@ -2144,12 +2034,7 @@ class DiskRlbenchDataset(BaseMultiDataset):
         ])
         static_extrinsic_matrix = np.dot(static_extrinsic_matrix, T_translate)
         gripper_extrinsic_matrix = np.dot(gripper_extrinsic_matrix, T_translate) # 为了与calvin点云坐标对齐
-        R = np.array([
-            [0, 1, 0, 0],
-            [-1,  0, 0, 0],
-            [0,  0, 1, 0],
-            [0,  0, 0, 1],
-        ])
+        R = AXIS_SWAP_R
         static_extrinsic_matrix=np.dot(static_extrinsic_matrix, R)
         gripper_extrinsic_matrix = np.dot(gripper_extrinsic_matrix, R) # 往前为X轴；往左为Y轴；往上为Z轴,需转为往右为X轴；往前为Y轴；往上为Z轴
 
@@ -2302,8 +2187,8 @@ class DiskColosseumDataset(BaseMultiDataset):
             depth_gripper = pickle.load(f)
         static_extrinsic_matrix = frames[file_idx].misc['front_camera_extrinsics']
         gripper_extrinsic_matrix = frames[file_idx].misc['wrist_camera_extrinsics']
-        static_extrinsic_matrix = np.linalg.inv(static_extrinsic_matrix) * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]]) # 单位矩阵的逆和转置是一样的
-        gripper_extrinsic_matrix = np.linalg.inv(gripper_extrinsic_matrix) * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]]) # 主要原因是deproject，对YZ加了一个符号
+        static_extrinsic_matrix = np.linalg.inv(static_extrinsic_matrix) * SIGN_FLIP_4X4 # 单位矩阵的逆和转置是一样的
+        gripper_extrinsic_matrix = np.linalg.inv(gripper_extrinsic_matrix) * SIGN_FLIP_4X4 # 主要原因是deproject，对YZ加了一个符号
         # 平移矩阵 T_translate
         T_translate = np.array([
             [1, 0, 0, 0.0], #  [ 0.016149   -0.3464728   0.84676421  1.        ] [0.47925746 0.38417864 1.57344687 1.        ]
@@ -2482,8 +2367,8 @@ class DiskMTDataset(BaseMultiDataset):
                                 'width': rgb_gripper.width,
                                 'fov': np.degrees(episode_info[self.gripper_cam_name].item()['fovy'])}}
 
-        calib['rgb_gripper']['extrinsic_matrix'] = np.linalg.inv(calib['rgb_gripper']['extrinsic_matrix']) * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
-        calib['rgb_static']['extrinsic_matrix'] = np.linalg.inv(calib['rgb_static']['extrinsic_matrix']) * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])
+        calib['rgb_gripper']['extrinsic_matrix'] = np.linalg.inv(calib['rgb_gripper']['extrinsic_matrix']) * SIGN_FLIP_4X4
+        calib['rgb_static']['extrinsic_matrix'] = np.linalg.inv(calib['rgb_static']['extrinsic_matrix']) * SIGN_FLIP_4X4
         R = np.array([
             [0, 1, 0, 0.3],
             [-1, 0, 0, 0],
@@ -2613,8 +2498,8 @@ class DiskChoresDataset(BaseMultiDataset):
         base_pose = traj["base_matrix"][start_idx:end_idx][()] # 4 4
         static_extrinsic_matrix = traj["calib/rgb_static/extrinsic_matrix"][start_idx:end_idx][()] # 4 4
         gripper_extrinsic_matrix = traj["calib/rgb_gripper/extrinsic_matrix"][start_idx:end_idx][()] # 4 4
-        static_extrinsic_matrix = np.linalg.inv(static_extrinsic_matrix) * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]])   #注意这里没有求逆
-        gripper_extrinsic_matrix = np.linalg.inv(gripper_extrinsic_matrix) * np.array([[1,1,1,1],[-1,-1,-1,-1],[-1,-1,-1,-1],[1,1,1,1]]) # 主要原因是deproject，对YZ加了一个符号 #注意这里没有求逆
+        static_extrinsic_matrix = np.linalg.inv(static_extrinsic_matrix) * SIGN_FLIP_4X4   #注意这里没有求逆
+        gripper_extrinsic_matrix = np.linalg.inv(gripper_extrinsic_matrix) * SIGN_FLIP_4X4 # 主要原因是deproject，对YZ加了一个符号 #注意这里没有求逆
         # 由于不同任务世界坐标系不同，这里使用本体坐标统一世界坐标系到本体上。
         static_extrinsic_matrix = np.einsum('mij,mjk->mik', static_extrinsic_matrix, base_pose)
         gripper_extrinsic_matrix = np.einsum('mij,mjk->mik', gripper_extrinsic_matrix, base_pose)
@@ -2729,6 +2614,365 @@ class DiskChoresDataset(BaseMultiDataset):
         return episode_lookup, lang_ann
 
 
+class DatasetBase(BaseMultiDataset):
+
+    def __init__(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+
+        delta_timestamps = {}
+        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(self.abs_datasets_dir)
+
+        his_range = list(range(self.window_size))
+        hist_objs_config = {"image":        his_range, 
+                            "wrist_image":  his_range,
+                            "state":        his_range,
+                            "actions":      his_range,
+                            "extrinsic_matrix": his_range,
+                            "intrinsic_matrix": his_range,
+                            "wrist_extrinsic_matrix": his_range,
+                            "wrist_intrinsic_matrix": his_range,
+                            "robot_obs": his_range,
+                            "goals": his_range,
+                            "fov": his_range,
+                            "wrist_fov": his_range,
+                            "depth": his_range,
+                            "wrist_depth": his_range,
+                            }
+        for obj_key, obj_config in hist_objs_config.items():
+            delta_timestamps.update(
+                {obj_key: [t / dataset_meta.fps for t in obj_config]}
+            )
+        self.data_loader = LeRobotDataset(  # 数据读取配置
+            repo_id=self.abs_datasets_dir,
+            delta_timestamps=delta_timestamps,
+        )
+
+    def __len__(self) -> int:
+        return len(self.data_loader)
+
+    def _compute_relative_action(self, robot_obs: np.ndarray, goal_obs: np.ndarray, gripper_action: float) -> np.ndarray:
+        """
+        Compute relative action from robot observation and goal.
+        
+        Args:
+            robot_obs: Robot observation array (at least 6 elements: xyz + euler angles)
+            goal_obs: Goal observation array (at least 6 elements: xyz + euler angles)
+            gripper_action: Gripper action value
+            
+        Returns:
+            Relative action array with coordinate transformation applied.
+            See: https://km.sankuai.com/collabpage/2537354641
+        """
+        # Convert euler angles to rotation matrices
+        robot_obs_ort = np.array(pybullet.getMatrixFromQuaternion(
+            pybullet.getQuaternionFromEuler(robot_obs[3:6])
+        )).reshape(3, 3)
+        actions_ort = np.array(pybullet.getMatrixFromQuaternion(
+            pybullet.getQuaternionFromEuler(goal_obs[3:6])
+        )).reshape(3, 3)
+        
+        # Coordinate system rotation matrix
+        B = np.array([
+            [0, 1, 0],
+            [-1, 0, 0],
+            [0, 0, 1]
+        ])
+        
+        # Apply coordinate transformation
+        robot_obs_ort = np.dot(B, robot_obs_ort)
+        actions_ort = np.dot(B, actions_ort)
+        
+        # Compute relative rotation
+        robot_obs_ort_inv = np.linalg.inv(robot_obs_ort)
+        rel_actions_ort = np.dot(actions_ort, robot_obs_ort_inv)
+        quat_error = robosuite_trans.mat2quat(rel_actions_ort)
+        delta_ort = robosuite_trans.quat2axisangle(quat_error) / 0.05
+        
+        # Compute relative position
+        delta_pos = (goal_obs[:3] - robot_obs[:3]) / 0.02
+        
+        # Combine position, orientation, and gripper action
+        action = np.array([*delta_pos, *delta_ort, gripper_action])
+        
+        # Apply coordinate transformation to action
+        return np.array([action[1], -action[0], action[2], action[3], action[4], action[5], action[6]])
+
+    def _build_frame_episode(self, item: Dict, file_idx: int) -> Dict:
+        """
+        Build a single frame's episode dictionary from raw data item.
+        
+        Args:
+            item: Raw data item from data loader
+            file_idx: Frame index within the window
+            
+        Returns:
+            Dictionary containing frame-level observations and metadata
+        """
+        episode = {}
+        
+        # Extract RGB images
+        episode['rgb_static'] = Image.fromarray(
+            (item['image'][file_idx].numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+        )
+        episode['rgb_gripper'] = Image.fromarray(
+            (item['wrist_image'][file_idx].numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+        )
+        
+        # Extract depth maps
+        episode['depth_static'] = item['depth'][file_idx].numpy()
+        episode['depth_gripper'] = item['wrist_depth'][file_idx].numpy()
+        
+        # Extract calibration matrices
+        episode['calib'] = {
+            "rgb_static": {
+                "extrinsic_matrix": item['extrinsic_matrix'][file_idx].numpy(),
+                "intrinsic_matrix": item['intrinsic_matrix'][file_idx].numpy(),
+                "distCoeffs_matrix": np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            },
+            "rgb_gripper": {
+                "extrinsic_matrix": item['wrist_extrinsic_matrix'][file_idx].numpy(),
+                "intrinsic_matrix": item['wrist_intrinsic_matrix'][file_idx].numpy(),
+                "distCoeffs_matrix": np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            }
+        }
+        
+        # Extract camera configuration
+        episode['cam_config'] = {
+            "static": {
+                "height": 200,
+                "width": 200,
+                "fov": item['fov'][file_idx].numpy()
+            },
+            "gripper": {
+                "height": 84,
+                "width": 84,
+                "fov": item['wrist_fov'][file_idx].numpy()
+            }
+        }
+        
+        # Fixed gripper camera to gripper transform
+        episode['gripper_cam2gripper'] = np.array([
+            [-0.0008, 0.9999, 0., -0.0001],
+            [0.9635, 0.0008, -0.2674, 0.0589],
+            [-0.2674, 0.0000, -0.9635, -0.1616],
+            [0., 0., 0., 1.]
+        ])
+        
+        # Extract robot state
+        episode['state_matrix'] = item['wrist_extrinsic_matrix'][file_idx].numpy()
+        episode['robot_obs'] = item['robot_obs'][file_idx].numpy()
+        episode['scene_obs'] = np.zeros(20)
+        
+        # Compute relative action
+        robot_obs = item['robot_obs'][file_idx].numpy()
+        goal_obs = item['goals'][file_idx].numpy()
+        gripper_action = item['actions'][file_idx].numpy()[-1]
+        episode['rel_actions'] = self._compute_relative_action(robot_obs, goal_obs, gripper_action)
+        
+        return episode
+
+    def _process_frame_data(
+        self, 
+        ep: Dict, 
+        colour_aug_random: int, 
+        jitter_state: Optional[Tuple] = None
+    ) -> Tuple[Dict, np.ndarray, Dict]:
+        """
+        Process a single frame's data: generate point cloud, apply color augmentation, and prepare calibration.
+        
+        Args:
+            ep: Frame episode dictionary
+            colour_aug_random: Random value for color augmentation decision
+            jitter_state: Optional state for consistent color jitter across frames
+            
+        Returns:
+            Tuple of (rgb_dict, pcd_array, calib_dict)
+        """
+        calib = ep['calib']
+        cam_config = ep['cam_config']
+        static_extrinsic_matrix = calib['rgb_static']['extrinsic_matrix']
+        gripper_extrinsic_matrix = calib['rgb_gripper']['extrinsic_matrix']
+        
+        # Create camera objects
+        static_cam = cam(
+            static_extrinsic_matrix,
+            cam_config['static']['height'],
+            cam_config['static']['width'],
+            cam_config['static']['fov']
+        )
+        gripper_cam = cam(
+            gripper_extrinsic_matrix,
+            cam_config['gripper']['height'],
+            cam_config['gripper']['width'],
+            cam_config['gripper']['fov']
+        )
+        
+        # Deproject depth to point clouds
+        static_pcd = deproject(
+            static_cam, ep['depth_static'], homogeneous=False, sanity_check=False
+        ).transpose(1, 0)
+        gripper_pcd = deproject(
+            gripper_cam, ep['depth_gripper'], homogeneous=False, sanity_check=False
+        ).transpose(1, 0)
+        cloud = np.concatenate([static_pcd, gripper_pcd], axis=0)
+        
+        # Prepare RGB images
+        rgb = {
+            'rgb_static': ep['rgb_static'],
+            'rgb_gripper': ep['rgb_gripper']
+        }
+        
+        # Apply color augmentation if enabled
+        if colour_aug_random > 2 and self.use_colour_aug:
+            rgb['rgb_static'], rgb['rgb_gripper'], jitter_state = apply_color_jitter_pair(
+                self.ColorJitter, rgb['rgb_static'], rgb['rgb_gripper'], jitter_state
+            )
+        
+        # Generate point cloud with RGB
+        static_rgb = np.reshape(np.array(rgb['rgb_static']), (-1, 3))
+        gripper_rgb = np.reshape(np.array(rgb['rgb_gripper']), (-1, 3))
+        pcd_rgb = np.concatenate([static_rgb, gripper_rgb], axis=0) / 255
+        pcd = self.vfe_generator.generate(cloud[:, :3], pcd_rgb)
+        
+        # Prepare calibration matrices with sign flip
+        calib['static_extrinsic_matrix'] = static_extrinsic_matrix * SIGN_FLIP_4X4
+        calib['static_intrinsic_matrix'] = calib['rgb_static']['intrinsic_matrix']
+        calib['static_distCoeffs_matrix'] = calib['rgb_static']['distCoeffs_matrix']
+        calib['gripper_extrinsic_matrix'] = gripper_extrinsic_matrix * SIGN_FLIP_4X4
+        calib['gripper_intrinsic_matrix'] = calib['rgb_gripper']['intrinsic_matrix']
+        calib['gripper_distCoeffs_matrix'] = calib['rgb_gripper']['distCoeffs_matrix']
+        calib['state_matrix'] = ep['state_matrix'] * SIGN_FLIP_4X4
+        calib['gripper_cam2gripper'] = ep['gripper_cam2gripper'] * SIGN_FLIP_4X4
+        calib['static_fov'] = np.array([
+            cam_config['static']['fov'],
+            cam_config['static']['height'],
+            cam_config['static']['width']
+        ])
+        calib['gripper_fov'] = np.array([
+            cam_config['gripper']['fov'],
+            cam_config['gripper']['height'],
+            cam_config['gripper']['width']
+        ])
+        
+        return rgb, pcd, calib
+
+    def _load_episode(self, idx: int, window_size: int) -> Dict[str, np.ndarray]:
+        """
+        Load and process an episode from the dataset.
+        
+        Args:
+            idx: Episode index
+            window_size: Number of frames in the episode window
+            
+        Returns:
+            Dictionary containing processed episode data
+        """
+        item = self.data_loader.__getitem__(idx)
+        
+        # Build frame-level episodes
+        episodes = [self._build_frame_episode(item, file_idx) for file_idx in range(window_size)]
+        
+        # Get observation keys (excluding language and RGB which are handled separately)
+        keys = list(chain(*self.observation_space.values()))
+        keys.remove("language")
+        keys.append("scene_obs")
+        keys.remove("rgb_static")
+        keys.remove("rgb_gripper")
+        
+        # Process all frames: generate point clouds, apply augmentation, prepare calibration
+        calibs = []
+        pcds = []
+        rgbs = []
+        colour_aug_random = random.randint(0, 10)
+        jitter_state = None
+        
+        for ep in episodes:
+            rgb, pcd, calib = self._process_frame_data(ep, colour_aug_random, jitter_state)
+            rgbs.append(rgb)
+            pcds.append(pcd)
+            calibs.append(calib)
+        
+        # Merge all frames into final episode dictionary
+        episode = {key: np.stack([ep[key] for ep in episodes]) for key in keys}
+        episode.update({key: np.stack([calib[key] for calib in calibs]) for key in keys_calib})
+        episode.update({key: [rgb[key] for rgb in rgbs] for key in RGB_KEYS})
+        episode['pcd'] = np.stack(pcds)
+        episode["language"] = item['task']
+        
+        return episode
+
+
+    def __getitem__(self, idx: Union[int, Tuple[int, int]], fixed_seed=False) -> Dict:
+        """
+        Get sequence of dataset.
+
+        Args:
+            idx: Index of the sequence.
+
+        Returns:
+            Loaded sequence.
+        """
+        resample = True
+        max_data_fetch_iteration = 300
+        last_error = None
+
+        for fetch_iteration in range(max_data_fetch_iteration):
+            try:
+                window_size = self.window_size
+                return self._get_sequences(idx, window_size)
+            except Exception as e:
+                last_error = e
+                print(f"[dataset] fetch_iter={fetch_iteration} idx={idx} error={e}")
+                if not resample:
+                    return None
+                idx = random.randint(0, len(self) - 1)
+
+        # Exhausted retries
+        raise RuntimeError(f"Failed to fetch data after {max_data_fetch_iteration} attempts. Last error: {last_error}")
+
+    def _get_sequences(self, idx: int, window_size: int, head: bool=False) -> Dict:
+        """
+        Load sequence of length window_size.
+
+        Args:
+            idx: Index of starting frame.
+            window_size: Length of sampled episode.
+
+        Returns:
+            dict: Dictionary of tensors of loaded sequence with different input modalities and actions.
+        """
+        episode = self._load_episode(idx, window_size)
+        if episode == 0:
+            return 0
+        
+        seq_state_obs = process_state(
+            episode, self.observation_space, self.transforms, self.proprio_state
+        )  # 保持不变，取episode['robot_obs']，并截取前15个
+        seq_rgb_obs = self.process_rgb(episode, self.observation_space, self.transforms)  # 执行self.transforms[rgb_obs_key]
+        seq_depth_obs = process_depth(episode, self.observation_space, self.transforms)  # 直接取depth
+        seq_acts = process_actions(episode, self.observation_space, self.transforms)  # 直接取rel_actions
+        info = get_state_info_dict(episode)
+        seq_calib_obs = self.process_calib(episode)
+        seq_pcd_obs = self.process_pcd(episode)
+        seq_lang = self.process_language(episode, self.transforms, self.with_lang)
+        info = self._add_language_info(info, idx)
+        seq_dict = {
+            **seq_state_obs,
+            **seq_rgb_obs,
+            **seq_depth_obs,
+            **seq_acts,
+            **info,
+            **seq_lang,
+            **seq_calib_obs,
+            **seq_pcd_obs,
+        }  # type:ignore
+        seq_dict["idx"] = idx  # type:ignore
+        return seq_dict
+        
 class DiskMultiDataset(Dataset):
     """
     Dataset that loads episodes as individual files from disk.
@@ -2798,6 +3042,10 @@ class DiskMultiDataset(Dataset):
                 data_loder=DiskChoresDataset(
                     datasets_dir=Path(dataset_dir),
                     **kwargs)
+            elif 'lerobot' in data_type:
+                data_loder = DatasetBase(
+                    datasets_dir=Path(dataset_dir),
+                    **kwargs)
             else:
                 assert False
             data_loder.data_name = data_type
@@ -2820,7 +3068,7 @@ class DiskMultiDataset(Dataset):
         for i in range(len(self.datas_loder)):
             if idx >= self.datas_len[i] and idx <= self.datas_len[i+1]:
                 # st = time.time()
-                sample = self.datas_loder[i].__getitem__(idx-self.datas_len[i])
+                sample = self.datas_loder[i].__getitem__(int(idx-self.datas_len[i]))
                 # if torch.distributed.get_rank() == 0:
                 #     # self.datas_loder[i].tmp.append(time.time() - st)
                 #     print(self.datas_loder[i].data_name, idx-self.datas_len[i], time.time() - st)
@@ -3280,9 +3528,9 @@ def get_coco_dataset(args, image_processor, tokenizer, epoch=0):
     
     dataloader = DataLoader(
         coco_dataset,
-        batch_size=args.batch_size_vl,
+        batch_size=args.training.batch_size_vl,
         pin_memory=False,
-        num_workers=args.workers,
+        num_workers=args.training.workers,
         prefetch_factor=3,
         sampler=sampler,
         persistent_workers=True,
@@ -3312,9 +3560,9 @@ def get_vqa_dataset(args, image_processor, tokenizer, epoch=0):
     
     dataloader = DataLoader(
         vqa_dataset,
-        batch_size=args.batch_size_vl,
+        batch_size=args.training.batch_size_vl,
         pin_memory=False,
-        num_workers=args.workers,
+        num_workers=args.training.workers,
         prefetch_factor=3,
         sampler=sampler,
         persistent_workers=True,
@@ -3326,7 +3574,7 @@ def get_vqa_dataset(args, image_processor, tokenizer, epoch=0):
 
 
 def get_multi_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
-    dataset_path = args.calvin_dataset
+    dataset_path = args.data.calvin_dataset
 
     # ann is dict including language and info
     shared_epoch = SharedEpoch(epoch=epoch)
@@ -3335,52 +3583,52 @@ def get_multi_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     transforms = dict()
     transforms["rgb_static"] = image_processor
     transforms["rgb_gripper"] = image_processor
-    preprocess_text_fn = functools.partial(preprocess_text_calvin, tokenizer=tokenizer, sample_mode=args.sample_mode, window_size=args.window_size)
+    preprocess_text_fn = functools.partial(preprocess_text_calvin, tokenizer=tokenizer, sample_mode=args.sample_mode, window_size=args.action_decoder.window_size)
     
     print(f"********************YF:sample_mode={args.sample_mode}***********************")
     if hasattr(args, 'data_tasks_groups'):
-        if args.data_tasks_groups == 'None':  data_tasks_groups = None
-        else: data_tasks_groups = args.data_tasks_groups
+        if args.data.data_tasks_groups == 'None':  data_tasks_groups = None
+        else: data_tasks_groups = args.data.data_tasks_groups
     else:
         data_tasks_groups = None
     calvin_dataset = DiskMultiDataset(
-        data_types=args.data_type,
+        data_types=args.data.data_type,
         datasets_dir=dataset_path,
         image_fn=preprocess_image_fn,
         text_fn=preprocess_text_fn,
-        window_size=args.window_size if args.window_size==1 else args.window_size+1,  # 注意这里，假如这里改的时候，后边_build_file_indices_lang也需要改 +1是为了生成下一张图片
-        rgb_pad=args.rgb_pad,
-        gripper_pad=args.gripper_pad,
-        traj_cons=args.traj_cons,
-        text_aug=args.text_aug,
-        dif_ws=args.dif_ws,
-        min_window_size=args.min_window_size,
-        max_window_size=args.max_window_size,
-        act_step=args.multi_step_action,
-        partial_data=args.partial_data,
-        colour_aug=args.colour_aug,
-        data_path_list = args.data_path_list,
-        state_matrixs_path = args.state_matrixs_path,
+        window_size=args.action_decoder.window_size if args.action_decoder.window_size==1 else args.action_decoder.window_size+1,  # 注意这里，假如这里改的时候，后边_build_file_indices_lang也需要改 +1是为了生成下一张图片
+        rgb_pad=args.cameras.rgb_pad,
+        gripper_pad=args.cameras.gripper_pad,
+        traj_cons=args.action_decoder.traj_cons,
+        text_aug=args.data.text_aug,
+        dif_ws=args.action_decoder.dif_ws,
+        min_window_size=args.action_decoder.min_window_size,
+        max_window_size=args.action_decoder.max_window_size,
+        act_step=args.action_decoder.multi_step_action,
+        partial_data=args.data.partial_data,
+        colour_aug=args.data.colour_aug,
+        data_path_list = args.data.data_path_list,
+        state_matrixs_path = args.data.state_matrixs_path,
         data_tasks_groups = data_tasks_groups,
-        env_resample = args.env_resample,
-        only_single_task = args.only_single_task,
+        env_resample = args.data.env_resample,
+        only_single_task = args.data.only_single_task,
         transforms=transforms,
     )
 
     round_fn = math.floor if floor else math.ceil
 
     num_samples = len(calvin_dataset) # 总样本数
-    global_batch_size = args.batch_size_calvin * args.world_size  # 总batch size
+    global_batch_size = args.training.batch_size_calvin * args.distributed.world_size  # 总batch size
     num_batches = round_fn(num_samples / global_batch_size)  # 总batch数
-    num_workers = max(1, args.workers)
+    num_workers = max(1, args.training.workers)
     num_worker_batches = round_fn(num_batches / num_workers)  # per dataloader worker
     num_batches = num_worker_batches * num_workers
     num_samples = num_batches * global_batch_size
 
     sampler = DistributedSampler(
         calvin_dataset,
-        num_replicas=args.world_size,
-        rank=args.rank,
+        num_replicas=args.distributed.world_size,
+        rank=args.distributed.rank,
         shuffle=True,
         seed=args.seed,
         drop_last=True,
@@ -3388,7 +3636,7 @@ def get_multi_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     # the batch_size and num_workers are per-GPU !
     dataloader = DataLoader(
         calvin_dataset,
-        batch_size=args.batch_size_calvin,
+        batch_size=args.training.batch_size_calvin,
         pin_memory=False,
         num_workers=num_workers,
         prefetch_factor=3,
@@ -3397,7 +3645,7 @@ def get_multi_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
         collate_fn=calvin_dataset.collater,
         drop_last=True
     )
-    # dataloader = DataLoader(calvin_dataset, batch_size=args.batch_size_calvin)
+    # dataloader = DataLoader(calvin_dataset, batch_size=args.training.batch_size_calvin)
     # add meta-data to dataloader instance for convenience
     dataloader.num_batches = num_batches
     dataloader.num_samples = num_samples

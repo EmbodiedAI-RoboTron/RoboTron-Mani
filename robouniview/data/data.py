@@ -1235,9 +1235,9 @@ def get_coco_dataset(args, image_processor, tokenizer, epoch=0):
     
     dataloader = DataLoader(
         coco_dataset,
-        batch_size=args.batch_size_vl,
+        batch_size=args.training.batch_size_vl,
         pin_memory=False,
-        num_workers=args.workers,
+        num_workers=args.training.workers,
         prefetch_factor=3,
         sampler=sampler,
         persistent_workers=True,
@@ -1266,9 +1266,9 @@ def get_vqa_dataset(args, image_processor, tokenizer, epoch=0):
     
     dataloader = DataLoader(
         vqa_dataset,
-        batch_size=args.batch_size_vl,
+        batch_size=args.training.batch_size_vl,
         pin_memory=False,
-        num_workers=args.workers,
+        num_workers=args.training.workers,
         prefetch_factor=3,
         sampler=sampler,
         persistent_workers=True,
@@ -1280,7 +1280,7 @@ def get_vqa_dataset(args, image_processor, tokenizer, epoch=0):
 
 
 def get_calvin_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
-    dataset_path = args.calvin_dataset
+    dataset_path = args.data.calvin_dataset
 
     # ann is dict including language and info
     shared_epoch = SharedEpoch(epoch=epoch)
@@ -1293,25 +1293,25 @@ def get_calvin_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
         datasets_dir=Path(dataset_path) / "training",
         image_fn=preprocess_image_fn,
         text_fn=preprocess_text_fn,
-        window_size=args.window_size,
-        rgb_pad=args.rgb_pad,
-        gripper_pad=args.gripper_pad,
-        traj_cons=args.traj_cons,
-        text_aug=args.text_aug,
-        dif_ws=args.dif_ws,
-        min_window_size=args.min_window_size,
-        max_window_size=args.max_window_size,
-        act_step=args.multi_step_action,
-        partial_data=args.partial_data,
+        window_size=args.action_decoder.window_size,
+        rgb_pad=args.cameras.rgb_pad,
+        gripper_pad=args.cameras.gripper_pad,
+        traj_cons=args.action_decoder.traj_cons,
+        text_aug=args.training.text_aug,
+        dif_ws=args.action_decoder.dif_ws,
+        min_window_size=args.action_decoder.min_window_size,
+        max_window_size=args.action_decoder.max_window_size,
+        act_step=args.action_decoder.multi_step_action,
+        partial_data=args.data.partial_data,
         use_aug=args.use_aug
     )
 
     round_fn = math.floor if floor else math.ceil
 
     num_samples = len(calvin_dataset) # episode_lookup数值，每个皮段中最后一段舍去，避免window_size中出现任务指令的变化？
-    global_batch_size = args.batch_size_calvin * args.world_size
+    global_batch_size = args.training.batch_size_calvin * args.world_size
     num_batches = round_fn(num_samples / global_batch_size)
-    num_workers = max(1, args.workers)
+    num_workers = max(1, args.training.workers)
     num_worker_batches = round_fn(num_batches / num_workers)  # per dataloader worker
     num_batches = num_worker_batches * num_workers
     num_samples = num_batches * global_batch_size
@@ -1327,7 +1327,7 @@ def get_calvin_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     # the batch_size and num_workers are per-GPU !
     dataloader = DataLoader(
         calvin_dataset,
-        batch_size=args.batch_size_calvin,
+        batch_size=args.training.batch_size_calvin,
         pin_memory=False,
         num_workers=num_workers,
         prefetch_factor=3,
@@ -1336,7 +1336,7 @@ def get_calvin_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
         collate_fn=calvin_dataset.collater,
         drop_last=True
     )
-    # dataloader = DataLoader(calvin_dataset, batch_size=args.batch_size_calvin)
+    # dataloader = DataLoader(calvin_dataset, batch_size=args.training.batch_size_calvin)
 
     # add meta-data to dataloader instance for convenience
     dataloader.num_batches = num_batches
@@ -1346,7 +1346,7 @@ def get_calvin_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
 
 
 def get_real_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
-    dataset_path = args.calvin_dataset
+    dataset_path = args.data.calvin_dataset
 
     # ann is dict including language and info
     shared_epoch = SharedEpoch(epoch=epoch)
@@ -1360,16 +1360,16 @@ def get_real_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
         # data_dir="/mnt/bn/robotics-data-hl/real_data/mode1_data_pick_place_001_0912/",
         data_dir="/mnt/bn/robotics-data-hl/real_data/mode1_data_pick_place_001_1023/",
         text_fn=preprocess_text_fn,
-        seq_len=args.window_size,
-        text_aug=args.text_aug
+        seq_len=args.action_decoder.window_size,
+        text_aug=args.training.text_aug
     )
 
     round_fn = math.floor if floor else math.ceil
 
     num_samples = len(calvin_dataset)
-    global_batch_size = args.batch_size_calvin * args.world_size
+    global_batch_size = args.training.batch_size_calvin * args.world_size
     num_batches = round_fn(num_samples / global_batch_size)
-    num_workers = max(1, args.workers)
+    num_workers = max(1, args.training.workers)
     num_worker_batches = round_fn(num_batches / num_workers)  # per dataloader worker
     num_batches = num_worker_batches * num_workers
     num_samples = num_batches * global_batch_size
@@ -1385,7 +1385,7 @@ def get_real_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     # the batch_size and num_workers are per-GPU !
     dataloader = DataLoader(
         calvin_dataset,
-        batch_size=args.batch_size_calvin,
+        batch_size=args.training.batch_size_calvin,
         pin_memory=False,
         num_workers=num_workers,
         prefetch_factor=3,
@@ -1394,7 +1394,7 @@ def get_real_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
         collate_fn=calvin_dataset.collator,
         drop_last=True
     )
-    # dataloader = DataLoader(calvin_dataset, batch_size=args.batch_size_calvin)
+    # dataloader = DataLoader(calvin_dataset, batch_size=args.training.batch_size_calvin)
 
     # add meta-data to dataloader instance for convenience
     dataloader.num_batches = num_batches
@@ -1404,7 +1404,7 @@ def get_real_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
 
 
 def get_calvin_dataset_debug(args, image_processor, tokenizer, epoch=0, floor=False):
-    dataset_path = args.calvin_dataset
+    dataset_path = args.data.calvin_dataset
 
     # ann is dict including language and info
     shared_epoch = SharedEpoch(epoch=epoch)
@@ -1417,18 +1417,18 @@ def get_calvin_dataset_debug(args, image_processor, tokenizer, epoch=0, floor=Fa
         datasets_dir=Path(dataset_path) / "training",
         image_fn=preprocess_image_fn,
         text_fn=preprocess_text_fn,
-        window_size=args.window_size,
-        rgb_pad=args.rgb_pad,
-        gripper_pad=args.gripper_pad,
-        traj_cons=args.traj_cons
+        window_size=args.action_decoder.window_size,
+        rgb_pad=args.cameras.rgb_pad,
+        gripper_pad=args.cameras.gripper_pad,
+        traj_cons=args.action_decoder.traj_cons
     )
 
     round_fn = math.floor if floor else math.ceil
 
     num_samples = len(calvin_dataset)
-    global_batch_size = args.batch_size_calvin * args.world_size
+    global_batch_size = args.training.batch_size_calvin * args.world_size
     num_batches = round_fn(num_samples / global_batch_size)
-    num_workers = max(1, args.workers)
+    num_workers = max(1, args.training.workers)
     num_worker_batches = round_fn(num_batches / num_workers)  # per dataloader worker
     num_batches = num_worker_batches * num_workers
     num_samples = num_batches * global_batch_size
@@ -1444,7 +1444,7 @@ def get_calvin_dataset_debug(args, image_processor, tokenizer, epoch=0, floor=Fa
     # the batch_size and num_workers are per-GPU !
     dataloader = DataLoader(
         calvin_dataset,
-        batch_size=args.batch_size_calvin,
+        batch_size=args.training.batch_size_calvin,
         pin_memory=False,
         num_workers=num_workers,
         prefetch_factor=3,
@@ -1452,7 +1452,7 @@ def get_calvin_dataset_debug(args, image_processor, tokenizer, epoch=0, floor=Fa
         persistent_workers=True,
         drop_last=True
     )
-    # dataloader = DataLoader(calvin_dataset, batch_size=args.batch_size_calvin)
+    # dataloader = DataLoader(calvin_dataset, batch_size=args.training.batch_size_calvin)
 
     # add meta-data to dataloader instance for convenience
     dataloader.num_batches = num_batches
@@ -1461,7 +1461,7 @@ def get_calvin_dataset_debug(args, image_processor, tokenizer, epoch=0, floor=Fa
     return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch, sampler=sampler, dataset=calvin_dataset)
 
 def get_calvin_sim_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
-    dataset_path = args.calvin_dataset
+    dataset_path = args.data.calvin_dataset
 
     # ann is dict including language and info
     shared_epoch = SharedEpoch(epoch=epoch)
@@ -1476,7 +1476,7 @@ def get_calvin_sim_dataset(args, image_processor, tokenizer, epoch=0, floor=Fals
 
     calvin_dataset = CalvinSim(
         Path(dataset_path) / "validation",
-        calvin_conf_path=args.calvin_conf_path,
+        calvin_conf_path=args.data.calvin_conf_path,
         calvin_seq_path=args.calvin_seq_path,
         transforms=transforms,
     )
@@ -1486,7 +1486,7 @@ def get_calvin_sim_dataset(args, image_processor, tokenizer, epoch=0, floor=Fals
     num_samples = len(calvin_dataset)
     global_batch_size = args.batch_size_sim * args.world_size
     num_batches = round_fn(num_samples / global_batch_size)
-    num_workers = max(1, args.workers)
+    num_workers = max(1, args.training.workers)
     num_worker_batches = round_fn(num_batches / num_workers)  # per dataloader worker
     num_batches = num_worker_batches * num_workers
     num_samples = num_batches * global_batch_size
@@ -1511,7 +1511,7 @@ def get_calvin_sim_dataset(args, image_processor, tokenizer, epoch=0, floor=Fals
         collate_fn=calvin_dataset.collater,
         drop_last=False
     )
-    # dataloader = DataLoader(calvin_dataset, batch_size=args.batch_size_calvin)
+    # dataloader = DataLoader(calvin_dataset, batch_size=args.training.batch_size_calvin)
 
     # add meta-data to dataloader instance for convenience
     dataloader.num_batches = num_batches

@@ -3150,9 +3150,9 @@ def get_coco_dataset(args, image_processor, tokenizer, epoch=0):
     
     dataloader = DataLoader(
         coco_dataset,
-        batch_size=args.batch_size_vl,
+        batch_size=args.training.batch_size_vl,
         pin_memory=False,
-        num_workers=args.workers,
+        num_workers=args.training.workers,
         prefetch_factor=3,
         sampler=sampler,
         persistent_workers=True,
@@ -3182,9 +3182,9 @@ def get_vqa_dataset(args, image_processor, tokenizer, epoch=0):
     
     dataloader = DataLoader(
         vqa_dataset,
-        batch_size=args.batch_size_vl,
+        batch_size=args.training.batch_size_vl,
         pin_memory=False,
-        num_workers=args.workers,
+        num_workers=args.training.workers,
         prefetch_factor=3,
         sampler=sampler,
         persistent_workers=True,
@@ -3196,7 +3196,7 @@ def get_vqa_dataset(args, image_processor, tokenizer, epoch=0):
 
 
 def get_multi_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
-    dataset_path = args.calvin_dataset
+    dataset_path = args.data.calvin_dataset
 
     # ann is dict including language and info
     shared_epoch = SharedEpoch(epoch=epoch)
@@ -3205,44 +3205,44 @@ def get_multi_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     transforms = dict()
     transforms["rgb_static"] = image_processor
     transforms["rgb_gripper"] = image_processor
-    preprocess_text_fn = functools.partial(preprocess_text_calvin, tokenizer=tokenizer, sample_mode=args.sample_mode, window_size=args.window_size)
+    preprocess_text_fn = functools.partial(preprocess_text_calvin, tokenizer=tokenizer, sample_mode=args.sample_mode, window_size=args.action_decoder.window_size)
     
     print(f"********************YF:sample_mode={args.sample_mode}***********************")
     if hasattr(args, 'data_tasks_groups'):
-        if args.data_tasks_groups == 'None':  data_tasks_groups = None
-        else: data_tasks_groups = args.data_tasks_groups
+        if args.data.data_tasks_groups == 'None':  data_tasks_groups = None
+        else: data_tasks_groups = args.data.data_tasks_groups
     else:
         data_tasks_groups = None
     calvin_dataset = DiskMultiDataset(
-        data_types=args.data_type,
+        data_types=args.data.data_type,
         datasets_dir=dataset_path,
         image_fn=preprocess_image_fn,
         text_fn=preprocess_text_fn,
-        window_size=args.window_size if args.window_size==1 else args.window_size+1,  # 注意这里，假如这里改的时候，后边_build_file_indices_lang也需要改 +1是为了生成下一张图片
-        rgb_pad=args.rgb_pad,
-        gripper_pad=args.gripper_pad,
-        traj_cons=args.traj_cons,
-        text_aug=args.text_aug,
-        dif_ws=args.dif_ws,
-        min_window_size=args.min_window_size,
-        max_window_size=args.max_window_size,
-        act_step=args.multi_step_action,
-        partial_data=args.partial_data,
+        window_size=args.action_decoder.window_size if args.action_decoder.window_size==1 else args.action_decoder.window_size+1,  # 注意这里，假如这里改的时候，后边_build_file_indices_lang也需要改 +1是为了生成下一张图片
+        rgb_pad=args.cameras.rgb_pad,
+        gripper_pad=args.cameras.gripper_pad,
+        traj_cons=args.action_decoder.traj_cons,
+        text_aug=args.training.text_aug,
+        dif_ws=args.action_decoder.dif_ws,
+        min_window_size=args.action_decoder.min_window_size,
+        max_window_size=args.action_decoder.max_window_size,
+        act_step=args.action_decoder.multi_step_action,
+        partial_data=args.data.partial_data,
         colour_aug=args.colour_aug,
         data_path_list = args.data_path_list,
         state_matrixs_path = args.state_matrixs_path,
         data_tasks_groups = data_tasks_groups,
         env_resample = args.env_resample,
-        only_single_task = args.only_single_task,
+        only_single_task = args.data.only_single_task,
         transforms=transforms,
     )
 
     round_fn = math.floor if floor else math.ceil
 
     num_samples = len(calvin_dataset) # 总样本数
-    global_batch_size = args.batch_size_calvin * args.world_size  # 总batch size
+    global_batch_size = args.training.batch_size_calvin * args.world_size  # 总batch size
     num_batches = round_fn(num_samples / global_batch_size)  # 总batch数
-    num_workers = max(1, args.workers)
+    num_workers = max(1, args.training.workers)
     num_worker_batches = round_fn(num_batches / num_workers)  # per dataloader worker
     num_batches = num_worker_batches * num_workers
     num_samples = num_batches * global_batch_size
@@ -3258,7 +3258,7 @@ def get_multi_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     # the batch_size and num_workers are per-GPU !
     dataloader = DataLoader(
         calvin_dataset,
-        batch_size=args.batch_size_calvin,
+        batch_size=args.training.batch_size_calvin,
         pin_memory=False,
         num_workers=num_workers,
         prefetch_factor=3,
@@ -3267,7 +3267,7 @@ def get_multi_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
         collate_fn=calvin_dataset.collater,
         drop_last=True
     )
-    # dataloader = DataLoader(calvin_dataset, batch_size=args.batch_size_calvin)
+    # dataloader = DataLoader(calvin_dataset, batch_size=args.training.batch_size_calvin)
     # add meta-data to dataloader instance for convenience
     dataloader.num_batches = num_batches
     dataloader.num_samples = num_samples

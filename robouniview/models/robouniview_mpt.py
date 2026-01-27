@@ -75,12 +75,12 @@ class MPTFlamingo(nn.Module):
         """
         super().__init__()
         self.args = args
-        self.occ_loss =  args.occ_loss
-        self.train_action = args.train_action
+        self.occ_loss =  args.loss.occ_loss
+        self.train_action = args.training.train_action
         self.fusion_mode = fusion_mode
         self.vis_dim = vis_dim
 
-        self.uvformer = DeformableTransformer(self.args,self.args.UVformer['transformer_config'])
+        self.uvformer = DeformableTransformer(self.args, self.args.UVformer.transformer_config)
         if self.occ_loss:
             layers_config = {'in_channels': self.vis_dim, 'out_channels': 160, 'upsample': 2, 'head_module': 'regnet950MF'}
 
@@ -90,20 +90,20 @@ class MPTFlamingo(nn.Module):
                 1,
                 reduction="mean",
             )
-        if hasattr(self.args, 'alignment_layer') and self.args.alignment_layer == 'Linear':
+        if hasattr(self.args, 'alignment_layer') and self.args.model.alignment_layer == 'Linear':
             self.alignment_layer = nn.Linear(self.vis_dim, self.vis_dim)
         
-        if hasattr(self.args, 'alignment_layer') and self.args.alignment_layer == 'Resampler':
+        if hasattr(self.args, 'alignment_layer') and self.args.model.alignment_layer == 'Resampler':
             self.alignment_layer = PerceiverResampler(dim=self.vis_dim)
 
         self.petr = PETR()
 
-        self.occ_loss_weight = self.args.occ_loss_weight
+        self.occ_loss_weight = self.args.loss.occ_loss_weight
 
         self.Upsample2d_3d = Upsample2d_3d()
         self.occ_decoder = Decoder_3d()
 
-        self.position_embedding = PositionEmbeddingSine(self.args.UVformer["transformer_config"]["hidden_dim"]/2, normalize=True)
+        self.position_embedding = PositionEmbeddingSine(self.args.UVformer.transformer_config.hidden_dim/2, normalize=True)
         self.use_gripper = use_gripper
         self.use_state = use_state
         
@@ -369,12 +369,12 @@ class MPTFlamingo(nn.Module):
             
         pos = self.position_embedding(uv_feat)
       
-        if hasattr(self.args, 'alignment_layer') and self.args.alignment_layer == 'Linear':
+        if hasattr(self.args, 'alignment_layer') and self.args.model.alignment_layer == 'Linear':
             uv_feat = rearrange(uv_feat, " (B T) C BH BW ->B T (BH BW) C", B=B, T=T)
             pos = rearrange(pos, " (B T) C BH BW ->B T (BH BW) C", B=B, T=T)
             uv_feat = uv_feat + pos
             uv_feat = self.alignment_layer(uv_feat)
-        if hasattr(self.args, 'alignment_layer') and self.args.alignment_layer == 'Resampler':
+        if hasattr(self.args, 'alignment_layer') and self.args.model.alignment_layer == 'Resampler':
        
             uv_feat = rearrange(uv_feat, " (B T F) C BH BW ->B T F (BH BW) C", B=B, T=T)
             pos = rearrange(pos, " (B T F) C BH BW ->B T F (BH BW) C", B=B, T=T)

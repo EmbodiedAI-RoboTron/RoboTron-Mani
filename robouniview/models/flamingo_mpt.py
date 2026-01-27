@@ -1,26 +1,46 @@
-import torch
-from einops import rearrange, repeat
-from torch import nn
+"""
+MPT Flamingo model implementation.
+
+This module provides the MPTFlamingo class which extends the base Flamingo
+architecture with multi-modal fusion capabilities for robot manipulation.
+"""
+
+# Standard library imports
 import copy
-from open_flamingo.src.helpers import PerceiverResampler
-from robouniview.models.action_head import DeterministicDecoder, DiffusionDecoder, FCDecoder, GPTDecoder, TokenFCDecoder, Multi_Action_Token_FCDecoder
-from robouniview.models.transformers.uvformer import DeformableTransformer
-from robouniview.models.transformers.position_encoding import PositionEmbeddingSine, RotaryPositionEncoding3D, get_2d_sincos_pos_embed
-from collections import namedtuple
-import yaml
-import argparse
-import copy
-import yaml
+import time
+
+# Third-party imports
 import numpy as np
-import cv2, time
-import pybullet as p
-from robouniview.models.transformers.petr import PETR, inverse_sigmoid
-from robouniview.models.loss_func import (
-    FocalLoss, Balanced_BCE_loss, CELoss, BinaryDiceLoss, CELossIgnoreSem, l1_loss)
-from robouniview.models.vision_transformer import Block
-from robouniview.models.occ_head import FastEncoderHead, Upsample2d_3d, Upsample2d_3d_UVFormer, Decoder_3d, Decoder_3d_4s, Upsample2d_3d_tiny, Decoder_3d_tiny
+import torch
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from einops import rearrange, repeat
+from open_flamingo.src.helpers import PerceiverResampler
+from torch import nn
+from torch.cuda.amp import autocast
+
+# Local application imports
+from robouniview.models.action_head import (
+    DeterministicDecoder,
+    DiffusionDecoder,
+    FCDecoder,
+    GPTDecoder,
+    Multi_Action_Token_FCDecoder,
+    TokenFCDecoder,
+)
+from robouniview.models.loss_func import Balanced_BCE_loss, l1_loss
+from robouniview.models.occ_head import (
+    Decoder_3d,
+    Decoder_3d_4s,
+    Upsample2d_3d,
+    Upsample2d_3d_UVFormer,
+)
+from robouniview.models.transformers.petr import PETR, inverse_sigmoid
+from robouniview.models.transformers.position_encoding import (
+    PositionEmbeddingSine,
+    get_2d_sincos_pos_embed,
+)
+from robouniview.models.transformers.uvformer import DeformableTransformer
+from robouniview.models.vision_transformer import Block
 
 class MPTFlamingo(nn.Module):
     def __init__(
@@ -82,9 +102,9 @@ class MPTFlamingo(nn.Module):
             self.lang_dim = lang_encoder.config.d_model  # mpt uses d_model
         else:
             self.lang_dim = lang_encoder.config.hidden_size
-        self.occ_loss =  args.occ_loss
-        self.occ_loss_weight = self.args.occ_loss_weight
-        self.train_action = args.train_action
+        self.occ_loss =  args.loss.occ_loss
+        self.occ_loss_weight = self.args.loss.occ_loss_weight
+        self.train_action = args.training.train_action
         self.fusion_mode = fusion_mode
         self.vis_dim = vis_dim
 
@@ -106,16 +126,16 @@ class MPTFlamingo(nn.Module):
         
         # encoder 
         if "UVFormer" in self.fusion_mode:
-            z_range = self.args.config['UVformer']['transformer_config']['ref_z_range']
-            assert int((z_range[1]-z_range[0]) / self.args.config['UVformer']['transformer_config']['grid_resolution'][-1]) == 5
+            z_range = self.args.UVformer.transformer_config.ref_z_range
+            assert int((z_range[1]-z_range[0]) / self.args.UVformer.transformer_config.grid_resolution[-1]) == 5
             self.Upsample2d_3d_UVFormer = Upsample2d_3d_UVFormer(in_channels=1024, out_channels=128, z=10) # UVFormer仅使用了两次上采样，从20*20*10-》80*80*40
-            self.uvformer = DeformableTransformer(self.args, self.args.UVformer['transformer_config'])
+            self.uvformer = DeformableTransformer(self.args, self.args.UVformer.transformer_config)
             self.occ_decoder_UVFormer = Decoder_3d_4s()
             if self.occ_loss:
                 self.balanced_bce_loss = Balanced_BCE_loss(1, reduction="mean",)
-            if hasattr(self.args, 'alignment_layer') and self.args.alignment_layer == 'Linear':
+            if hasattr(self.args.model, 'alignment_layer') and self.args.model.alignment_layer == 'Linear':
                 self.alignment_layer = nn.Linear(self.vis_dim, self.vis_dim)
-            elif hasattr(self.args, 'alignment_layer') and self.args.alignment_layer == 'Resampler':
+            elif hasattr(self.args.model, 'alignment_layer') and self.args.model.alignment_layer == 'Resampler':
                 self.alignment_layer = PerceiverResampler(dim=self.vis_dim)
         else:
             self.rgb = nn.Embedding(1,1024)
@@ -130,8 +150,8 @@ class MPTFlamingo(nn.Module):
                 Block(self.lang_dim, 16, 4, qkv_bias=True, qk_scale=None, norm_layer=nn.LayerNorm)
                 for i in range(decoder_depth)])
             self.occ_decoder = Decoder_3d()
-            z_range = self.args.config['UVformer']['transformer_config']['ref_z_range']
-            assert int((z_range[1]-z_range[0]) / self.args.config['UVformer']['transformer_config']['grid_resolution'][-1]) == 5
+            z_range = self.args.UVformer.transformer_config.ref_z_range
+            assert int((z_range[1]-z_range[0]) / self.args.UVformer.transformer_config.grid_resolution[-1]) == 5
             self.Upsample2d_3d = Upsample2d_3d(in_channels=2048, out_channels=128, z=5) 
         # encoder 公用
         self.petr = PETR(**self.args.PETR) if hasattr(self.args, 'PETR') else PETR() # 当UVFormer的时候仅有夹爪位置
@@ -145,7 +165,7 @@ class MPTFlamingo(nn.Module):
             )
 
 
-        self.position_embedding = PositionEmbeddingSine(self.args.UVformer["transformer_config"]["hidden_dim"]/2, normalize=True)
+        self.position_embedding = PositionEmbeddingSine(self.args.UVformer.transformer_config.hidden_dim/2, normalize=True)
         # self.pos_rgb, self.pos_gripper = None, None
         self.use_gripper = use_gripper
         self.use_state = use_state
@@ -217,10 +237,10 @@ class MPTFlamingo(nn.Module):
             elif 'vit_concat' in fusion_mode:
                 self.lang_encoder.lm_head = self.action_head = FCDecoder(in_features, self.window_size, 
                 use_diff=use_diff, last_action=last_action, fusion_mode=fusion_mode, use_state=use_state, return_feature=return_feature, multi_step_action=multi_step_action)
-            elif self.args.multi_action_token :
+            elif self.args.action_decoder.multi_action_token :
                 self.lang_encoder.lm_head = self.action_head = Multi_Action_Token_FCDecoder(in_features, self.window_size, 
                 use_diff=use_diff, last_action=last_action, fusion_mode=fusion_mode, use_state=use_state, return_feature=return_feature, multi_step_action=multi_step_action, nclass_gripper=nclass_gripper)
-            elif self.args.action_token :
+            elif self.args.action_decoder.action_token :
                 self.lang_encoder.lm_head = self.action_head = TokenFCDecoder(in_features, self.window_size, 
                 use_diff=use_diff, last_action=last_action, fusion_mode=fusion_mode, use_state=use_state, return_feature=return_feature, multi_step_action=multi_step_action)
             else:
@@ -250,6 +270,95 @@ class MPTFlamingo(nn.Module):
             self.lm_head = self.lang_encoder.lm_head
             self.lang_encoder.lm_head = nn.Identity()
         self.env = None
+
+    def _decode_image_from_tokens(
+        self,
+        output_hs: torch.Tensor,
+        mask: torch.Tensor,
+        decoder_embed: nn.Module,
+        decoder_blocks: nn.ModuleList,
+        decoder_norm: nn.Module,
+        decoder_pred: nn.Module,
+        decoder_pos_embed: nn.Parameter,
+        output_size: tuple = (112, 112),
+        patch_size: int = 14,
+        num_tokens: int = 8,
+    ):
+        """
+        Decode image from masked tokens.
+        
+        Args:
+            output_hs: Hidden states from language model (B, T, D)
+            mask: Boolean mask indicating token positions (B, T)
+            decoder_embed: Decoder embedding layer
+            decoder_blocks: Decoder transformer blocks
+            decoder_norm: Decoder normalization layer
+            decoder_pred: Decoder prediction head
+            decoder_pos_embed: Positional embedding for decoder
+            output_size: Output image size (H, W)
+            patch_size: Patch size for reconstruction
+            num_tokens: Number of tokens to extract
+            
+        Returns:
+            Reconstructed image tensor
+        """
+        b = output_hs.shape[0]
+        mask_indices = mask.nonzero(as_tuple=True)
+        feature = output_hs[mask_indices[0], mask_indices[1]]
+        feature = rearrange(feature, "(B T N) D -> B T N D", B=b, N=num_tokens)
+        B, T, N, D = feature.shape
+
+        n_patches = (output_size[0] // patch_size) ** 2
+        mask_tokens = self.mask_token.repeat(B, T, n_patches, 1)
+        mask_tokens = mask_tokens + decoder_pos_embed.unsqueeze(0).repeat(B, T, 1, 1)
+        
+        feature = decoder_embed(feature)
+        pred = torch.cat([feature, mask_tokens], dim=2)
+        pred = pred.reshape(-1, pred.shape[-2], pred.shape[-1])
+        
+        for blk in decoder_blocks:
+            pred = blk(pred)
+        
+        pred = decoder_norm(pred)
+        pred = decoder_pred(pred)
+        pred = pred.reshape(B, T, -1, pred.shape[-1])
+        pred = pred[:, :, -n_patches:]
+        pred = rearrange(pred, "B T N H -> (B T) H N")
+
+        unsplit = nn.Fold(
+            output_size=output_size,
+            kernel_size=(patch_size, patch_size),
+            stride=(patch_size, patch_size),
+            padding=(0, 0),
+        )
+        pred = unsplit(pred)
+        return pred
+
+    def _prepare_calib_dict(self, calib: list, window_size: int):
+        """
+        Prepare calibration dictionary from calib tensors.
+        
+        Args:
+            calib: List of calibration tensors [extrinsic_static, intrinsic_static, ...]
+            window_size: Window size for temporal slicing
+            
+        Returns:
+            Dictionary with calibration parameters for rgb_static and rgb_gripper
+        """
+        return {
+            'rgb_static': {
+                'extrinsic_matrix': rearrange(calib[0][:, :window_size], "B T H W -> (B T) H W").cpu(),
+                'intrinsic_matrix': rearrange(calib[1][:, :window_size], "B T H W -> (B T) H W").cpu(),
+                'distCoeffs_matrix': rearrange(calib[2][:, :window_size], "B T H -> (B T) H").cpu(),
+                'fov': rearrange(calib[7][:, :window_size], "B T H -> (B T) H").cpu(),
+            },
+            'rgb_gripper': {
+                'extrinsic_matrix': rearrange(calib[3][:, :window_size], "B T H W -> (B T) H W").cpu(),
+                'intrinsic_matrix': rearrange(calib[4][:, :window_size], "B T H W -> (B T) H W").cpu(),
+                'distCoeffs_matrix': rearrange(calib[5][:, :window_size], "B T H -> (B T) H").cpu(),
+                'fov': rearrange(calib[8][:, :window_size], "B T H -> (B T) H").cpu(),
+            }
+        }
 
     def forward(
         self,
@@ -292,10 +401,7 @@ class MPTFlamingo(nn.Module):
             use_cache: whether to use cached key values. See use_cache
                 documentation in Hugging Face CausalLM models.
         """
-        st_yf = time.time(); TESTTIME=False
 
-        # raw_rgb = vision_x.clone()
-        # raw_gripper = vision_gripper.clone()
         self.pcd = pcd
         assert (vision_x is not None) or use_cached_vision_x, ("Must provide either vision_x or use_cached_vision_x to True.")
 
@@ -312,32 +418,6 @@ class MPTFlamingo(nn.Module):
 
         kwarg = {}
         output, static_pred, gripper_pred, obs_pred, aux_loss = [], None, None, None, {}
-        if 0: # I对IL,O对IL，A对AL, L对L
-            with torch.no_grad():
-                _mask = torch.zeros_like(attention_mask)
-                query_mask_matrix = repeat(torch.zeros_like(_mask), 'b n->b m n', m=attention_mask.shape[1])
-                if static_mask is not None:
-                    static_I_mask = static_mask.clone()
-                    static_I_mask[:, :-1] |= static_mask[:, 1:]
-                    static_I_mask[:, 1:] |= static_mask[:, :-1]
-                    _mask |= static_I_mask
-                    query_mask_matrix = query_mask_matrix | torch.einsum('mi,mj->mij', static_I_mask, static_I_mask)
-                if gripper_mask is not None:
-                    gripper_I_mask = gripper_mask.clone()
-                    gripper_I_mask[:, :-1] |= gripper_mask[:, 1:]
-                    gripper_I_mask[:, 1:] |= gripper_mask[:, :-1]
-                    _mask |= gripper_I_mask
-                    query_mask_matrix = query_mask_matrix | torch.einsum('mi,mj->mij', gripper_I_mask, gripper_I_mask)
-                if obs_mask is not None:
-                    obs_O_mask = obs_mask.clone()
-                    obs_O_mask[:, :-1] |= obs_mask[:, 1:]
-                    obs_O_mask[:, 1:] |= obs_mask[:, :-1]
-                    _mask |= obs_O_mask
-                    query_mask_matrix = query_mask_matrix | torch.einsum('mi,mj->mij', obs_O_mask, obs_O_mask)
-                query_mask_matrix = query_mask_matrix | ~_mask[:, None] | ~_mask[..., None] # YF: 除了IO外其他都是相关attention的    
-                del static_I_mask, gripper_I_mask, obs_O_mask, _mask
-                kwarg['query_mask_matrix'] = query_mask_matrix
-        if TESTTIME: ed_ecd_yf = time.time(); print(f"YF: image encoder {ed_ecd_yf-st_yf}")
         if self.train_action:
             output = self.lang_encoder(
                 input_ids=lang_x,
@@ -347,319 +427,273 @@ class MPTFlamingo(nn.Module):
                 output_hidden_states=True,
                 **kwarg,
             )
-            output_hs = output.hidden_states[-1] # YF: 3*505*2048
+            output_hs = output.hidden_states[-1]
             b, t, d = output_hs.shape
             
-            if TESTTIME: ed_fd_yf = time.time(); print(f"YF: lang forward {ed_fd_yf-ed_ecd_yf}")
+            # Decode static camera image
             if static_mask is not None:
-                mask_indices = static_mask.nonzero(as_tuple=True) # 获取掩码为True的元素及其索引
-                static_feature = output_hs[mask_indices[0], mask_indices[1]] # 根据掩码从output_hs中选值; 288*20248
-                static_feature = rearrange(static_feature, "(B T N) D -> B T N D", B=b, N=8) # 8表示8个token
-                B, T, N, D = static_feature.shape
-                
-                mask_tokens = self.mask_token.repeat(B, T, (112//14)**2, 1)  # (b, l, n_patches, h)
-                mask_tokens = mask_tokens +  self.decoder_pos_embed_static.unsqueeze(0).repeat(B, T, 1, 1)  # (b, l, n_patches, h)
-                static_feature = self.decoder_embed(static_feature) 
-                static_pred_ = torch.cat([static_feature, mask_tokens], dim=2)
+                static_pred = self._decode_image_from_tokens(
+                    output_hs, static_mask,
+                    self.decoder_embed, self.decoder_blocks,
+                    self.decoder_norm, self.decoder_pred,
+                    self.decoder_pos_embed_static,
+                    output_size=(112, 112), patch_size=14, num_tokens=8
+                )
 
-                static_pred_ = static_pred_.reshape(-1, static_pred_.shape[-2], static_pred_.shape[-1])  # (b * l, n_patches + n_patch_latens, h)
-                for blk in self.decoder_blocks:
-                    static_pred_ = blk(static_pred_)
-                static_pred_ = self.decoder_norm(static_pred_)
-                static_pred = self.decoder_pred(static_pred_) 
-                static_pred = static_pred.reshape(B, T, -1, static_pred.shape[-1])  # (b, l, n_patches + n_patch_latens, h)
-                static_pred = static_pred[:, :, -(112//14)**2:]  # (b, l, n_patches, h)
-                static_pred = rearrange(static_pred, "B T N H -> (B T) H N")
-
-                unsplit = nn.Fold(output_size=(112, 112), kernel_size=(14, 14), stride=(14, 14), padding=(0, 0))
-                static_pred = unsplit(static_pred)
-
+            # Decode gripper camera image
             if gripper_mask is not None:
-                mask_indices = gripper_mask.nonzero(as_tuple=True) # 获取掩码为True的元素及其索引
-                gripper_feature = output_hs[mask_indices[0], mask_indices[1]] # 根据掩码从output_hs中选值; 288*20248
-                gripper_feature = rearrange(gripper_feature, "(B T N) D -> B T N D", B=b, N=8) # 8表示8个token
-                B, T, N, D = gripper_feature.shape
+                gripper_pred = self._decode_image_from_tokens(
+                    output_hs, gripper_mask,
+                    self.decoder_embed, self.decoder_blocks,
+                    self.decoder_norm, self.decoder_pred,
+                    self.decoder_pos_embed_gripper,
+                    output_size=(112, 112), patch_size=14, num_tokens=8
+                )
 
-                mask_tokens = self.mask_token.repeat(B, T, (112//14)**2, 1)  # (b, l, n_patches, h)
-                mask_tokens = mask_tokens +  self.decoder_pos_embed_gripper.unsqueeze(0).repeat(B, T, 1, 1)  # (b, l, n_patches, h)
-                gripper_feature = self.decoder_embed(gripper_feature) 
-                gripper_pred_ = torch.cat([gripper_feature, mask_tokens], dim=2)
-
-                gripper_pred_ = gripper_pred_.reshape(-1, gripper_pred_.shape[-2], gripper_pred_.shape[-1])  # (b * l, n_patches + n_patch_latens, h)
-                for blk in self.decoder_blocks:
-                    gripper_pred_ = blk(gripper_pred_)
-                gripper_pred_ = self.decoder_norm(gripper_pred_)
-                gripper_pred = self.decoder_pred(gripper_pred_) 
-
-                gripper_pred = gripper_pred.reshape(B, T, -1, gripper_pred.shape[-1])  # (b, l, n_patches + n_patch_latens, h)
-                gripper_pred = gripper_pred[:, :, -(112//14)**2:]  # (b, l, n_patches, h)
-                gripper_pred = rearrange(gripper_pred, "B T N H -> (B T) H N")
-            
-                unsplit = nn.Fold(output_size=(112, 112), kernel_size=(14, 14), stride=(14, 14), padding=(0, 0))
-                gripper_pred = unsplit(gripper_pred)
-
+            # Decode occupancy from obs tokens
             if obs_mask is not None:
-                mask_indices = obs_mask.nonzero(as_tuple=True) # 获取掩码为True的元素及其索引
-                obs_feature = output_hs[mask_indices[0], mask_indices[1]] # 根据掩码从output_hs中选值; 288*20248
-                obs_feature = rearrange(obs_feature, "(B T N) D -> B T N D", B=b, N=8) # 8表示8个token
+                b = output_hs.shape[0]
+                mask_indices = obs_mask.nonzero(as_tuple=True)
+                obs_feature = output_hs[mask_indices[0], mask_indices[1]]
+                obs_feature = rearrange(obs_feature, "(B T N) D -> B T N D", B=b, N=8)
                 B, T, N, D = obs_feature.shape
 
-                mask_tokens = self.mask_token.repeat(B, T, (10)**2, 1)  # (b, l, n_patches, h)
-                mask_tokens = mask_tokens +  self.decoder_pos_embed_obs.unsqueeze(0).repeat(B, T, 1, 1)  # (b, l, n_patches, h)
-                obs_feature = self.decoder_embed_obs(obs_feature) 
-                obs_pred_ = torch.cat([obs_feature, mask_tokens], dim=2) 
+                mask_tokens = self.mask_token.repeat(B, T, 100, 1)  # 10x10 patches
+                mask_tokens = mask_tokens + self.decoder_pos_embed_obs.unsqueeze(0).repeat(B, T, 1, 1)
+                obs_feature = self.decoder_embed_obs(obs_feature)
+                obs_pred_ = torch.cat([obs_feature, mask_tokens], dim=2)
 
-                obs_pred_ = obs_pred_.reshape(-1, obs_pred_.shape[-2], obs_pred_.shape[-1])  # (b * l, n_patches + n_patch_latens, h)
+                obs_pred_ = obs_pred_.reshape(-1, obs_pred_.shape[-2], obs_pred_.shape[-1])
                 for blk in self.decoder_blocks_obs:
                     obs_pred_ = blk(obs_pred_)
-                obs_pred_ = obs_pred_[:, -(10)**2:]  # (b, l, n_patches, h)
-                obs_pred_ =  rearrange(obs_pred_, " B (H W) D-> B D H W", H=10, W=10)
-                # obs_pred_ =  rearrange(obs_pred_, " B H W D -> B D H W")
-                obs_pred_ = self.Upsample2d_3d(obs_pred_) 
+                obs_pred_ = obs_pred_[:, -100:]  # Extract 10x10 patches
+                obs_pred_ = rearrange(obs_pred_, "B (H W) D -> B D H W", H=10, W=10)
+                obs_pred_ = self.Upsample2d_3d(obs_pred_)
                 obs_pred = self.occ_decoder(obs_pred_[0])
                 obs_pred = rearrange(obs_pred, "BT C Z H W -> BT H W Z C")
             
-             # self.decoder_pos_embed_static  
-            if TESTTIME: ed_rc_yf = time.time(); print(f"YF: image decoder {ed_rc_yf-ed_fd_yf}")
-            if self.args.action_token or self.args.multi_action_token:
+            # Action prediction  
+            if self.args.action_decoder.action_token or self.args.action_decoder.multi_action_token:
                 output_hs = self.lm_head(output_hs, state_tensor=state_tensor, action_mask = action_mask)
             else:
                 output_hs = self.lm_head(output_hs, state_tensor=state_tensor)
             output.logits = output_hs
-            if TESTTIME: ed_yf = time.time(); print(f"YF: loss {ed_yf-ed_rc_yf}")
-            if obs_pred is None and self.occ_loss: obs_pred = self.occ
+            # Only fall back to UVFormer occ prediction when it was computed (pcd provided).
+            if obs_pred is None and self.occ_loss and self.pcd is not None:
+                obs_pred = self.occ
         
         if self.occ_loss and self.pcd is not None:
             aux_loss['loss_occ'] = self.loss_occ()
             
         return output, static_pred, gripper_pred, obs_pred, aux_loss
 
-    def _encode_vision_x(self, vision_x: torch.Tensor):
-        """
-        Compute media tokens from vision input by passing it through vision encoder and conditioning language model.
-        Args:
-            vision_x (torch.Tensor): Vision input
-                shape (B, T_img, F, C, H, W)
-                Images in the same chunk are collated along T_img, and frames are collated along F
-                Currently only F=1 is supported (single-frame videos)
-
-        rearrange code based on https://github.com/dhansmair/flamingo-mini
-        """
-        assert False
-        assert vision_x.ndim == 6, "vision_x should be of shape (b, T_img, F, C, H, W)"
-        b, T, F = vision_x.shape[:3]
-        assert F == 1, "Only single frame supported"
-
-        vision_x = rearrange(vision_x, "b T F c h w -> (b T F) c h w")
-        with torch.no_grad():
-            vision_x = self.vision_encoder.visual(vision_x)[1]
-        vision_x = rearrange(vision_x, "(b T F) v d -> b T F v d", b=b, T=T, F=F)
-
-        vision_x = self.perceiver(vision_x)  # reshapes to (b, T, n, d)
-
-        for layer in self.lang_encoder._get_decoder_layers():
-            layer.condition_vis_x(vision_x)
-
-        return vision_x
 
     def _encode_vision(self, vision_x: torch.Tensor, state_tensor=None):
         """
-        Compute media tokens from vision input by passing it through vision encoder and conditioning language model.
+        Encode vision input through vision encoder with mixed precision.
+        
         Args:
-            vision_x (torch.Tensor): Vision input
-                shape (B, T_img, F, C, H, W)
-                Images in the same chunk are collated along T_img, and frames are collated along F
+            vision_x: Vision input, shape (B, T_img, F, C, H, W)
                 Currently only F=1 is supported (single-frame videos)
-
-        rearrange code based on https://github.com/dhansmair/flamingo-mini
+            state_tensor: Optional state tensor (unused in this method)
+            
+        Returns:
+            Encoded vision features, shape (B, T, F, v, d)
         """
-
         assert vision_x.ndim == 6, "vision_x should be of shape (b, T_img, F, C, H, W)"
         b, T, F = vision_x.shape[:3]
         assert F == 1, "Only single frame supported"
 
         vision_x = rearrange(vision_x, "b T F c h w -> (b T F) c h w")
-        with torch.no_grad() and autocast(): # 这里使用autocast混合精度训练
+        with torch.no_grad(), autocast():
             vision_x = self.vision_encoder.visual(vision_x)[1]
         vision_x = rearrange(vision_x, "(b T F) v d -> b T F v d", b=b, T=T, F=F)
         return vision_x
 
+
+    def _encode_temporal_fusion(
+        self,
+        vision_rgb: torch.Tensor,
+        vision_gripper: torch.Tensor,
+        calib,
+        state_tensor=None
+    ):
+        """
+        Encode temporal multi-view fusion (without UVFormer).
+        
+        Args:
+            vision_rgb: RGB vision input, shape (B, T, 1, 1, C, H, W)
+            vision_gripper: Gripper vision input, shape (B, T, 1, 1, C, H, W)
+            calib: Calibration tensors
+            state_tensor: Optional state tensor
             
-    def _encode_temporal_fusion(self, vision_rgb: torch.Tensor, # [b,t,1,1,c,h,w]
-                                    vision_gripper: torch.Tensor,  calib, state_tensor=None):
-        # if hasattr(self.args, 'T_Embedding') and self.args.T_Embedding :
-        #     self.T_Embedding_layer = nn.Sequential(
-        #         nn.Linear( 1 , self.vis_dim*4),
-        #         nn.ReLU(),
-        #         nn.Linear(self.vis_dim*4, self.vis_dim),
-        #     )
-        TESTTIME=False; st_yf=time.time()
+        Returns:
+            vision_x: Fused vision features
+            feats: Additional features dictionary
+        """
         vision_rgb = vision_rgb.squeeze(2)
         vision_gripper = vision_gripper.squeeze(2)
 
         with torch.no_grad():
-            vision_rgb = self._encode_vision(vision_rgb) #  b T F v d. # 注意这里不算梯度
+            vision_rgb = self._encode_vision(vision_rgb)
             vision_gripper = self._encode_vision(vision_gripper)
-        # vision_gripper = vision_gripper.clone().detach()
-        # vision_rgb = vision_rgb.clone().detach()
-        B, T, F, v, d  = vision_rgb.shape
+        B, T, F, v, d = vision_rgb.shape
 
-        if hasattr(self.args, 'T_Embedding') and self.args.T_Embedding :
+        # Optional temporal embedding
+        if hasattr(self.args, 'T_Embedding') and self.args.T_Embedding:
             for t in range(T):
-                T_Embedding = self.T_Embedding_layer(inverse_sigmoid(torch.tensor(t*1.0/T)).unsqueeze(0).to(vision_rgb.device))
-                vision_rgb[:,t,...] = vision_rgb[:,t,...] + T_Embedding
-                vision_gripper[:,t,...] = vision_gripper[:,t,...] + T_Embedding
+                t_emb = self.T_Embedding_layer(
+                    inverse_sigmoid(torch.tensor(t * 1.0 / T)).unsqueeze(0).to(vision_rgb.device)
+                )
+                vision_rgb[:, t, ...] += t_emb
+                vision_gripper[:, t, ...] += t_emb
 
-        vision_gripper = rearrange(vision_gripper, " B T F (H W) C  -> (B T F) C H W", H=16, W=16)
-        vision_rgb = rearrange(vision_rgb, " B T F (H W) C  -> (B T F) C H W", H=16, W=16)
+        vision_gripper = rearrange(vision_gripper, "B T F (H W) C -> (B T F) C H W", H=16, W=16)
+        vision_rgb = rearrange(vision_rgb, "B T F (H W) C -> (B T F) C H W", H=16, W=16)
 
-        if TESTTIME: ed_en_yf=time.time(); print(f"YF: image encoder {ed_en_yf-st_yf}")
-
+        # Apply calibration-based positional encoding
         if calib is not None:
-            # assert self.window_size==12
-            _calib1 = {'rgb_static':{'extrinsic_matrix':rearrange(calib[0][:,:self.window_size]," B T H W -> (B T) H W").cpu(),  # 注意此处最多是window_size个
-                                    'intrinsic_matrix':rearrange(calib[1][:,:self.window_size]," B T H W -> (B T) H W").cpu(),
-                                    'distCoeffs_matrix':rearrange(calib[2][:,:self.window_size]," B T H -> (B T) H").cpu(),
-                                    'fov':rearrange(calib[7][:,:self.window_size]," B T H -> (B T) H").cpu()},
-                        'rgb_gripper':{'extrinsic_matrix':rearrange(calib[3][:,:self.window_size]," B T H W -> (B T) H W").cpu(),
-                                        'intrinsic_matrix':rearrange(calib[4][:,:self.window_size]," B T H W -> (B T) H W").cpu(),
-                                        'distCoeffs_matrix':rearrange(calib[5][:,:self.window_size]," B T H -> (B T) H").cpu(),
-                                        'fov':rearrange(calib[8][:,:self.window_size]," B T H -> (B T) H").cpu()}}
-            if TESTTIME: ed_petr_yf=time.time(); print(f"YF: petr forward1 {ed_petr_yf-ed_en_yf}")
+            _calib_dict = self._prepare_calib_dict(calib, self.window_size)
+            
             with torch.no_grad():
-                # if self.pos_rgb is None or self.pos_rgb.shape != vision_rgb.shape:
                 pos_rgb = self.position_embedding(vision_rgb)
-                # if self.pos_gripper is None or self.pos_gripper.shape != vision_gripper.shape:
                 pos_gripper = self.position_embedding(vision_gripper)
-                # pos_rgb, pos_gripper = pos_rgb.detach(), pos_gripper.detach()
 
-            pos_embed_rgb = self.petr(vision_rgb, _calib1['rgb_static'], pos_rgb, 200, 200, 0)
-            pos_embed_gripper = self.petr(vision_gripper, _calib1['rgb_gripper'], pos_gripper, 84, 84, 0)
-            vision_rgb = vision_rgb+pos_embed_rgb
-            vision_gripper = vision_gripper+pos_embed_gripper
+            pos_embed_rgb = self.petr(vision_rgb, _calib_dict['rgb_static'], pos_rgb, 200, 200, 0)
+            pos_embed_gripper = self.petr(vision_gripper, _calib_dict['rgb_gripper'], pos_gripper, 84, 84, 0)
+            vision_rgb = vision_rgb + pos_embed_rgb
+            vision_gripper = vision_gripper + pos_embed_gripper
 
-            vision_rgb = rearrange(vision_rgb, " (B T F) C BH BW ->B T F (BH BW) C", B=B, T=T)
-            vision_gripper = rearrange(vision_gripper, " (B T F) C BH BW ->B T F (BH BW) C", B=B, T=T)
+            vision_rgb = rearrange(vision_rgb, "(B T F) C BH BW -> B T F (BH BW) C", B=B, T=T)
+            vision_gripper = rearrange(vision_gripper, "(B T F) C BH BW -> B T F (BH BW) C", B=B, T=T)
 
-        if TESTTIME: ed_petr_yf=time.time(); print(f"YF: petr forward {ed_petr_yf-ed_en_yf}")
-
+        # Add modality embeddings
         vision_rgb = vision_rgb + self.rgb.weight[0]
-        vision_gripper = vision_gripper + self.gripper.weight[0] 
-        #forward(self, mlvl_feats, calibs, pos, pad_h, pad_w,fov)
+        vision_gripper = vision_gripper + self.gripper.weight[0]
 
+        # Perceiver resampler
         vision_rgb = self.perceiver(vision_rgb)
         vision_gripper = self.perceiver(vision_gripper)
 
-        if self.args.multi_action_token:
-            pass
-        else:
-            vision_rgb = rearrange(vision_rgb, " B T N D -> B (T N) D")
-            vision_gripper = rearrange(vision_gripper, " B T N D -> B (T N) D")
-            vision_rgb = vision_rgb.unsqueeze(1)
-            vision_gripper = vision_gripper.unsqueeze(1)
+        # Reshape for multi-action-token or standard mode
+        if not self.args.action_decoder.multi_action_token:
+            vision_rgb = rearrange(vision_rgb, "B T N D -> B (T N) D").unsqueeze(1)
+            vision_gripper = rearrange(vision_gripper, "B T N D -> B (T N) D").unsqueeze(1)
 
-        vision_x = torch.cat([vision_rgb, vision_gripper], dim=2) #B T 2N D
-       # vision_x = rearrange(vision_x, "B T (I N) D ->B (T I) N D", I = 2)
+        vision_x = torch.cat([vision_rgb, vision_gripper], dim=2)
 
+        # Condition language model
         for layer in self.lang_encoder._get_decoder_layers():
             layer.condition_vis_x(vision_x)
 
-        feats = {}
-        if TESTTIME: ed_yf=time.time(); print(f"YF: image insert {ed_yf-ed_petr_yf}")
-
-        return vision_x, feats
+        return vision_x, {}
     
-    def _encode_multi_vision_UVformer_fusion(self, vision_rgb: torch.Tensor, vision_gripper: torch.Tensor, calib, state_tensor=None):
+    def _encode_multi_vision_UVformer_fusion(
+        self,
+        vision_rgb: torch.Tensor,
+        vision_gripper: torch.Tensor,
+        calib,
+        state_tensor=None
+    ):
+        """
+        Encode multi-view vision with UVFormer fusion.
         
+        Args:
+            vision_rgb: RGB vision input, shape (B, T, 1, 1, C, H, W)
+            vision_gripper: Gripper vision input, shape (B, T, 1, 1, C, H, W)
+            calib: Calibration tensors
+            state_tensor: Optional state tensor
+            
+        Returns:
+            vision_x: Fused vision features
+            feats: Additional features dictionary
+        """
         vision_rgb = vision_rgb.squeeze(2)
         vision_gripper = vision_gripper.squeeze(2)
         dtype = vision_rgb.dtype
+        
         with torch.no_grad():
             vision_rgb = self._encode_vision(vision_rgb).to(dtype)
             vision_gripper = self._encode_vision(vision_gripper).to(dtype)
         B, T, F, HxW, C = vision_rgb.shape
 
-        vision_rgb = rearrange(vision_rgb, " B T F (H W) C  -> (B T F) C H W", H=16, W=16)
-        vision_gripper = rearrange(vision_gripper, " B T F (H W) C  -> (B T F) C H W", H=16, W=16)
+        vision_rgb = rearrange(vision_rgb, "B T F (H W) C -> (B T F) C H W", H=16, W=16)
+        vision_gripper = rearrange(vision_gripper, "B T F (H W) C -> (B T F) C H W", H=16, W=16)
 
-        _calib1 = {'rgb_static':{'extrinsic_matrix':rearrange(calib[0][:,:self.window_size]," B T H W -> (B T) H W").cpu(),  # 注意此处最多是window_size个
-                                'intrinsic_matrix':rearrange(calib[1][:,:self.window_size]," B T H W -> (B T) H W").cpu(),
-                                'distCoeffs_matrix':rearrange(calib[2][:,:self.window_size]," B T H -> (B T) H").cpu(),
-                                'fov':rearrange(calib[7][:,:self.window_size]," B T H -> (B T) H").cpu()},
-                    'rgb_gripper':{'extrinsic_matrix':rearrange(calib[3][:,:self.window_size]," B T H W -> (B T) H W").cpu(),
-                                    'intrinsic_matrix':rearrange(calib[4][:,:self.window_size]," B T H W -> (B T) H W").cpu(),
-                                    'distCoeffs_matrix':rearrange(calib[5][:,:self.window_size]," B T H -> (B T) H").cpu(),
-                                    'fov':rearrange(calib[8][:,:self.window_size]," B T H -> (B T) H").cpu()}}
-        x = [[vision_rgb], [vision_gripper]]
-        uv_feat = self.uvformer(x, _calib1)  # 20*20*10
+        # Prepare calibration dictionary
+        _calib_dict = self._prepare_calib_dict(calib, self.window_size)
         
-        if self.occ_loss:
-            occ_feat = uv_feat.clone() 
-            occ_feat, _ = self.Upsample2d_3d_UVFormer(occ_feat)#(B*T, C, Z, H, W) 
+        # UVFormer multi-view fusion
+        x = [[vision_rgb], [vision_gripper]]
+        uv_feat = self.uvformer(x, _calib_dict)
+
+        # Generate occupancy prediction if enabled
+        if self.occ_loss and self.pcd is not None:
+            occ_feat = uv_feat.clone()
+            occ_feat, _ = self.Upsample2d_3d_UVFormer(occ_feat)
             self.occ = self.occ_decoder_UVFormer(occ_feat)
             self.occ = rearrange(self.occ, "BT C Z H W -> BT H W Z C")
         
-        # uv_feat perceiver
+        # Apply alignment layer to UVFormer features
         with torch.no_grad():
             pos_rgb = self.position_embedding(uv_feat)
             pos_gripper = self.position_embedding(vision_gripper)
-        if hasattr(self.args, 'alignment_layer') and self.args.alignment_layer == 'Linear':
-            uv_feat = rearrange(uv_feat, " (B T) C BH BW ->B T (BH BW) C", B=B, T=T)
-            pos_rgb = rearrange(pos_rgb, " (B T) C BH BW ->B T (BH BW) C", B=B, T=T)
+        
+        if hasattr(self.args.model, 'alignment_layer') and self.args.model.alignment_layer == 'Linear':
+            uv_feat = rearrange(uv_feat, "(B T) C BH BW -> B T (BH BW) C", B=B, T=T)
+            pos_rgb = rearrange(pos_rgb, "(B T) C BH BW -> B T (BH BW) C", B=B, T=T)
             uv_feat = uv_feat + pos_rgb
             uv_feat = self.alignment_layer(uv_feat)
-        elif hasattr(self.args, 'alignment_layer') and self.args.alignment_layer == 'Resampler':
-            uv_feat = rearrange(uv_feat, " (B T F) C BH BW ->B T F (BH BW) C", B=B, T=T)
-            pos_rgb = rearrange(pos_rgb, " (B T F) C BH BW ->B T F (BH BW) C", B=B, T=T)
+        elif hasattr(self.args.model, 'alignment_layer') and self.args.model.alignment_layer == 'Resampler':
+            uv_feat = rearrange(uv_feat, "(B T F) C BH BW -> B T F (BH BW) C", B=B, T=T)
+            pos_rgb = rearrange(pos_rgb, "(B T F) C BH BW -> B T F (BH BW) C", B=B, T=T)
             uv_feat = uv_feat + pos_rgb
             uv_feat = self.alignment_layer(uv_feat)
 
-        # petr + perceiver
-        rg_em = _calib1['rgb_gripper']['extrinsic_matrix'].clone()
-        if 0:
-            gripper_cam2gripper = rearrange(calib[9][:,:self.window_size], " B T H W -> (B T) H W").cpu()
-            for i, _rg_em in enumerate(rg_em):
-                _calib1['rgb_gripper']['extrinsic_matrix'][i]  = gripper_cam2gripper[i] # rg_em[i] @ torch.linalg.inv(state_matrix[i])
-        else:
-            state_matrix = rearrange(calib[6][:,:self.window_size], " B T H W -> (B T) H W").cpu()
-            for i, _rg_em in enumerate(rg_em):
-                _calib1['rgb_gripper']['extrinsic_matrix'][i]  = rg_em[i] @ torch.linalg.inv(state_matrix[i])
-        # rs_em = _calib1['rgb_static']['extrinsic_matrix'].clone()
-        # for i, _rs_em in enumerate(rs_em):
-        #     _calib1['rgb_static']['extrinsic_matrix'][i]  = rs_em[i] @ torch.linalg.inv(state_matrix[i])
-        pos_embed = self.petr(vision_gripper, _calib1['rgb_gripper'], pos_gripper)
+        # Process gripper features with PETR + Perceiver
+        state_matrix = rearrange(calib[6][:, :self.window_size], "B T H W -> (B T) H W").cpu()
+        rg_em = _calib_dict['rgb_gripper']['extrinsic_matrix'].clone()
+        for i, _rg_em in enumerate(rg_em):
+            _calib_dict['rgb_gripper']['extrinsic_matrix'][i] = rg_em[i] @ torch.linalg.inv(state_matrix[i])
+        
+        pos_embed = self.petr(vision_gripper, _calib_dict['rgb_gripper'], pos_gripper)
         uv_gripper_feat = vision_gripper + pos_embed
-        uv_gripper_feat = rearrange(uv_gripper_feat, " (B T F) C BH BW ->B T F (BH BW) C", B=B, T=T)
+        uv_gripper_feat = rearrange(uv_gripper_feat, "(B T F) C BH BW -> B T F (BH BW) C", B=B, T=T)
         uv_gripper_feat = self.perceiver(uv_gripper_feat)
         
-        # send language model
+        # Concatenate and condition language model
         vision_x = torch.concat([uv_feat, uv_gripper_feat], dim=2)
         for layer in self.lang_encoder._get_decoder_layers():
             layer.condition_vis_x(vision_x)
         
-        feats = {}
-        return vision_x, feats
+        return vision_x, {}
         
     def loss_occ(self):
         """
-        Args:
-            self.preds: shape of (bs, w, h, z, c)
-            self.trues: shape of (bs, w, h, z, c)
+        Compute occupancy loss for 3D voxel grid prediction.
+        
+        Computes separate losses for:
+        - Channel 0 (occupancy): Balanced BCE loss
+        - Channels 1-3 (RGB): L1 loss masked by occupancy
+        
+        Returns:
+            Dictionary of losses for each channel
         """
-
-        self.occ_true = self.pcd
-        self.occ_true = rearrange(self.occ_true, "B T H W Z C  -> (B T) H W Z C") # B T H W Z C
+        self.occ_true = rearrange(self.pcd, "B T H W Z C -> (B T) H W Z C")
 
         c_classes = self.occ_true.shape[-1]
-        grid_cls = ['occ','r','g','b']
-        loss ={}
+        grid_cls = ['occ', 'r', 'g', 'b']
+        loss = {}
+        
         for ind in range(c_classes):
-            preds_ind = self.occ[:,:,:,:, ind]
-            trues_ind = self.occ_true[:,:,:,:, ind] 
-            if ind == 0: 
+            preds_ind = self.occ[:, :, :, :, ind]
+            trues_ind = self.occ_true[:, :, :, :, ind]
+            
+            if ind == 0:  # Occupancy channel: use balanced BCE
                 loss_ind = self.balanced_bce_loss(preds_ind, trues_ind)
-            else:
-                loss_ind = l1_loss(preds_ind, trues_ind, self.occ_true[:,:,:,:, 0])
+            else:  # RGB channels: use L1 masked by occupancy
+                loss_ind = l1_loss(preds_ind, trues_ind, self.occ_true[:, :, :, :, 0])
+            
             loss[f"grid_cls_{grid_cls[ind]}_loss"] = loss_ind * self.occ_loss_weight[ind]
             
         return loss

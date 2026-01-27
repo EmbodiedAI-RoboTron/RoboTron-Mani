@@ -1,0 +1,247 @@
+# ============================================================================
+# EXPERIMENT SETTINGS
+# ============================================================================
+run_name: RobotFlamingoDBG
+seed: 42
+debug: false
+save_dir: exps/tmp
+
+# ============================================================================
+# DATA CONFIGURATION
+# ============================================================================
+data:
+  # Dataset types and paths
+  data_type: [lerobot]
+  data_eval: [calvin]  # Which dataset to use for evaluation
+  data_path_list: [[/mnt/data/datasets/lerobot/calvin/taskD_D],[],[],[],[]]
+  calvin_dataset: [/mnt/data/datasets/lerobot/calvin/taskD_D]
+  calvin_seq_path: /mnt/data/yanfeng/project/RoboTron-Mani/eval_sequences.json
+  calvin_conf_path: /mnt/data/yanfeng/project/RoboTron-Mani/third_party/calvin/calvin_models/conf
+  state_matrixs_path: ["","","","",""]
+  
+  # Data processing
+  data_tasks_groups: None
+  dataset_resampled: true
+  env_resample: false
+  partial_data: false
+  real_data: false
+  only_single_task: false
+  
+  # Data augmentation
+  colour_aug: [0, 0, 0, 0]  # brightness, contrast, saturation, hue
+  text_aug: false
+  rotate: true
+  extrinsic_jitter: 0
+
+# Camera configuration
+cameras:
+  cam_trained: ["rgb_static","rgb_gripper"]
+  original_image_shapes:
+    rgb_static: [200, 200, 3]
+    rgb_gripper: [84, 84, 3]
+  rgb_pad: 10
+  gripper_pad: 4
+  image_feature_out: [0]
+
+# ============================================================================
+# MODEL ARCHITECTURE
+# ============================================================================
+model:
+  # Core architecture
+  fusion_mode: Temporal_UVFormer
+  alignment_layer: Linear
+  llm_name: mpt_dolly_3b
+  hidden_size: 768
+  
+  # Language model
+  lm_path: /mnt/data/modelzoo/anas-awadalla/mpt-1b-redpajama-200b-dolly
+  tokenizer_path: /mnt/data/modelzoo/anas-awadalla/mpt-1b-redpajama-200b-dolly
+  cross_attn_every_n_layers: 4
+  use_media_placement_augmentation: false
+  
+  # Vision encoder
+  vision_encoder_path: ViT-L-14
+  vision_encoder_pretrained: openai
+  clip_cache_dir: /mnt/data/tmp/
+  
+  # Pretrained checkpoints
+  openflamingo_checkpoint: /mnt/data/modelzoo/openflamingo/OpenFlamingo-3B-vitl-mpt1b-langinstruct/checkpoint.pt
+  load_from_checkpoint: null
+  resume_from_checkpoint: null
+  from_scratch: false
+  no_pretrain: false
+  
+  # Model components
+  use_gripper: true
+  use_state: false
+  sep_resampler: false
+  residual: false
+
+# Action decoder configuration
+action_decoder:
+  decoder_type: fc
+  head_type: fc
+  action_token: true
+  multi_action_token: true
+  multi_step_action: 1
+  
+  # Temporal settings
+  window_size: 12
+  min_window_size: 12
+  max_window_size: 24
+  hist_window: 1
+  eval_hist_size: -1
+  use_hist: false
+  
+  # Action prediction
+  tcp_rel: false
+  last_action: false
+  future_act_len: -1
+  n_obs_steps: 6
+  pad_length: -1
+  pooling: max
+  
+  # Diffusion settings
+  n_timesteps: 150
+  predict_epsilon: false
+  diff_horizon: 32
+  
+  # Planning
+  replan: -1
+  dif_ws: false
+  traj_cons: true
+
+# UVFormer configuration (3D spatial reasoning)
+UVformer:
+  cam_trained: ["rgb_static","rgb_gripper"]
+  original_image_shapes:
+    rgb_static: [200, 200, 3]
+    rgb_gripper: [84, 84, 3]
+  type: DeformableTransformer
+  transformer_config:
+    task_name: LLD
+    hidden_dim: 1024
+    nhead: 8
+    num_decoder_layers: 2
+    dim_feedforward: 1024
+    dropout: 0.1
+    PreProcessing: {left: 0.5, right: 0.5, front: 0.5, back: 0.5, dilate: 1}
+    grid_resolution: [0.05, 0.05, 0.2]
+    ref_z_range: [0.0, 1.0]
+    rotate: true
+    upsample: 2
+    self_attn_type: cosformer
+    reuse_ref_point: false
+    norm: None
+    use_ffn: false
+
+# PETR configuration (position encoding)
+PETR:
+  hidden_dim: 1024
+  depth_step: 0.05
+  depth_num: 4
+  depth_start: 0.05
+  position_range: [-0.2, -0.2, -0.05, 0.2, 0.2, 0.3]  # In gripper coordinate system
+
+# BEVFormer configuration (optional)
+bevformer_config: bevformer_config/bevformer_b_s_rotate.yaml
+
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+training:
+  # Basic training settings
+  num_epochs: 10
+  batch_size_calvin: 4
+  batch_size_sim: 1
+  batch_size_vl: 20
+  gradient_accumulation_steps: 1
+  train_num_samples_calvin: 100
+  
+  # Optimizer settings
+  learning_rate: 0.00005
+  lr_scheduler: constant
+  weight_decay: 0.1
+  warmup_steps: 1000
+  
+  # Training flags
+  train_action: true
+  train_uvformer: true
+  train_params: -1
+  
+  # Model freezing
+  freeze_embed: false
+  freeze_sampler: false
+  unfreeze_vit: false
+  
+  # Mixed training
+  cotrain: false
+  vl_task_weights: 0.005
+  
+  # Precision and device
+  precision: fp32
+  workers: 4
+
+# Loss configuration
+loss:
+  loss_weight: {occ: 0.1, action: 1}
+  loss_multiplier_calvin: 1.0
+  occ_loss: true
+  occ_loss_weight: [0.5, 0.25, 0.25, 0.25]  # occ, r, g, b
+
+# Sample mode configuration
+# -1: Random token arrangement
+# 0: image + action
+# 1: action only
+# 2: OCC + action
+# 3: image + OCC + action
+# 4: OCC + image + action
+sample_mode: 1
+
+# ============================================================================
+# EVALUATION CONFIGURATION
+# ============================================================================
+evaluation:
+  eval: true
+  eval_first: false
+  eval_epoch_interval: 1
+  validation: false
+  visualize: false
+  reset: false
+  diverse_inst: false
+
+# ============================================================================
+# DISTRIBUTED TRAINING
+# ============================================================================
+distributed:
+  dist_url: env://
+  dist_backend: nccl
+  horovod: false
+  no_set_device_rank: false
+  local_rank: 0
+
+# ============================================================================
+# LOGGING AND CHECKPOINTING
+# ============================================================================
+logging:
+  logging_steps: 100
+  save_every_iter: 10000
+  delete_previous_checkpoint: false
+  
+  # Wandb settings
+  report_to_wandb: false
+  wandb_project: RoboFlamingo_D2D
+  wandb_entity: null
+  save_checkpoints_to_wandb: false
+  offline: false
+
+# ============================================================================
+# LEGACY / EXPERIMENTAL FLAGS
+# ============================================================================
+experimental:
+  sep_lm_head: false
+  clip_state: false
+  fwd_pred: false
+  fwd_pred_hand: false
+  no_image_patch: false
+  global_latent: 1

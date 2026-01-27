@@ -1,13 +1,29 @@
+"""
+Action head decoders for robot manipulation models.
+
+This module provides various decoder architectures for predicting robot actions,
+including LSTM, FC, GPT, and Diffusion-based decoders.
+"""
+
+# Standard library imports
+import copy
+import math
 from typing import Optional, Tuple
 
+# Third-party imports
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from einops import rearrange, repeat
 from open_flamingo.src.helpers import PerceiverResampler
+
+# Local application imports
+from robouniview.data import pytorch3d_transforms as pytorch3d_transforms
+from robouniview.data.keyframe_data import normalise_quat, unnormalize_pos
 from robouniview.models.normalizer import LinearNormalizer
 from robouniview.models.trajectory_gpt2 import get_gpt_model
-# from .unets import *
-import copy
-from einops import rearrange, repeat
+from robouniview.models.multihead_custom_attention import MultiheadCustomAttention
 
 
 def lstm_decoder(
@@ -148,23 +164,6 @@ class ActionDecoder(nn.Module):
     def clear_hidden_state(self) -> None:
         pass
 
-# class MLPDecoder(ActionDecoder):
-#     def __init__(
-#         self,
-#         in_features: int,
-#         window_size: int,
-#         history_len = None,
-#         out_features: int = 6,
-#         hidden_size: int = 1024,
-#         num_layers: int = 4,
-#         policy_rnn_dropout_p: float = 0.1,
-#         use_diff=False,
-#         last_action=False,
-#         fusion_mode='',
-#         use_state=False,
-#         return_feature=False,
-#         multi_step_action=1
-#     ):
 class TokenFCDecoder(ActionDecoder):
     def __init__(
         self,
